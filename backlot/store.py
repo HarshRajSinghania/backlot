@@ -330,8 +330,10 @@ CREATE INDEX IF NOT EXISTS idx_slack_channel_author ON slack_messages(channel, a
 -- 2**63, so a collision is vanishingly unlikely, and as the PRIMARY KEY one fails the import
 -- loudly rather than silently replacing the earlier message.
 --
--- `thread_id` is another message's `id` (the thread root's), not a dataset identifier: it is
--- resolved at import along with every other cross-row reference.
+-- `thread_id` is the thread's served id, not a dataset identifier: `synth.gmail_message_id` over
+-- the record's `thread`, else its doc_id, computed at import. It is the `id` of the message whose
+-- dataset id is that key (by default, the root); with no such message, it is an id no message
+-- holds.
 CREATE TABLE IF NOT EXISTS gmail_messages (
     id TEXT PRIMARY KEY, mailbox TEXT NOT NULL, author_email TEXT NOT NULL,
     title TEXT NOT NULL, content TEXT NOT NULL,
@@ -472,13 +474,15 @@ DROP INDEX IF EXISTS idx_github_served;
 -- `parent_id` holds the PARENT'S KEY, the same value this table is keyed on -- a subtask points at
 -- a served id, never at a dataset identifier. It keeps the generic name because
 -- :func:`children` reads it uniformly across jira, confluence and notion.
+-- numeric_id is assigned after keys settle at import: NULL only in that transaction.
+-- TEXT keeps leading zeroes distinct at lookup; UNIQUE prevents two issues sharing an id.
 CREATE TABLE IF NOT EXISTS jira_issues (
     key TEXT PRIMARY KEY, project TEXT NOT NULL, author_email TEXT NOT NULL,
     title TEXT NOT NULL, content TEXT NOT NULL,
     status TEXT, issuetype TEXT, priority TEXT, labels TEXT, components TEXT,
     issuelinks TEXT, parent_id TEXT, changelog TEXT, created_ts INTEGER NOT NULL, updated_ts INTEGER,
     assignee_email TEXT, reporter_email TEXT, resolution TEXT, resolution_ts INTEGER,
-    duedate TEXT, fix_versions TEXT, owner_display TEXT
+    duedate TEXT, fix_versions TEXT, owner_display TEXT, numeric_id TEXT UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_jira_project ON jira_issues(project);
 CREATE INDEX IF NOT EXISTS idx_jira_parent ON jira_issues(parent_id);
@@ -1146,10 +1150,12 @@ def list_documents(
     state=None,
     not_author_email=None,
     exclude_trashed=False,
+    title=None,
 ) -> list[sqlite3.Row]:
     # state: only valid for source_type="github" — it's the only items table with a `state`
     # column; passing it for any other source_type raises sqlite3.OperationalError. Likewise
-    # exclude_trashed, which only gdrive_files has a column for.
+    # exclude_trashed, which only gdrive_files has a column for. title matches the whole title,
+    # ignoring ASCII case.
     tbl = table(source_type)
     sql = f"SELECT * FROM {tbl} WHERE 1=1"
     params: list = []
@@ -1159,6 +1165,9 @@ def list_documents(
         params.append(state)
     if exclude_trashed:
         sql += " AND COALESCE(trashed, 0) = 0"
+    if title is not None:
+        sql += " AND title = ? COLLATE NOCASE"
+        params.append(title)
     clause, cparams = _acl_clause(source_type, visible_ids=visible_ids)
     sql += clause + f" ORDER BY {_order_by(source_type)} LIMIT ? OFFSET ?"
     params += cparams + [limit, offset]
@@ -1969,6 +1978,7 @@ def count_documents(
     state=None,
     exclude_trashed=False,
     roots_only=False,
+    title=None,
 ) -> int:
     # state: only valid for source_type="github" — it's the only items table with a `state`
     # column; passing it for any other source_type raises sqlite3.OperationalError. Likewise
@@ -1986,6 +1996,9 @@ def count_documents(
         sql += " AND COALESCE(trashed, 0) = 0"
     if roots_only:
         sql += _GMAIL_ROOT
+    if title is not None:
+        sql += " AND title = ? COLLATE NOCASE"
+        params.append(title)
     clause, cparams = _acl_clause(source_type, visible_ids=visible_ids)
     sql += clause
     params += cparams
@@ -2803,6 +2816,18 @@ def jira_by_key(conn, key, visible_ids=None) -> sqlite3.Row | None:
     """
     clause, cp = _acl_clause("jira", visible_ids=visible_ids)
     return conn.execute(f"SELECT * FROM jira_issues WHERE key = ?{clause}", [key, *cp]).fetchone()
+
+
+def jira_by_numeric_id(conn, issue_id: str, visible_ids=None) -> sqlite3.Row | None:
+    """One issue by its reported numeric id, matched as spelled. Measured on Jira Cloud
+    (2026-10-04): `issue/{id}` and `issue/{id}/comment` answer on v2 and v3 what the key answers,
+    and the id with `0` or `00` in front is a 404. The importer assigns unique ids, and TEXT
+    comparison preserves exact spelling.
+    """
+    clause, cp = _acl_clause("jira", visible_ids=visible_ids)
+    return conn.execute(
+        f"SELECT * FROM jira_issues WHERE numeric_id = ?{clause}", [issue_id, *cp]
+    ).fetchone()
 
 
 def _file_head_clause(visible_ids=None, tbl: str = "t") -> tuple[str, list]:

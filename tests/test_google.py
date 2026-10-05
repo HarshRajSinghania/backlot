@@ -528,6 +528,34 @@ def test_gmail_messages_list_pagination_stable_and_ordered(client, admin_h, ro_c
     assert [m["id"] for m in both] == [a, b]  # pages concatenate in order
 
 
+def test_gmail_max_results_is_capped_at_500(tmp_path):
+    """The cap `_gmail_max_results` records, on both listings."""
+    from tests._helpers import corpus_client
+
+    records = [
+        {
+            "source_type": "gmail",
+            "doc_id": f"m{i}",
+            "mailbox": "ava",
+            "title": f"Message {i}",
+            "content": f"Body {i}.",
+            "author_email": "bob@acme.com",
+            "readers": ["ava@acme.com"],
+            "created": f"2026-01-{i % 28 + 1:02d}T{i // 28 % 24:02d}:00:00Z",
+        }
+        for i in range(502)
+    ]
+    with corpus_client(tmp_path, records) as (client, settings):
+        h = {"Authorization": f"Bearer {settings.admin_token}"}
+        for kind in ("messages", "threads"):
+            for asked, served in ((499, 499), (500, 500), (501, 500), (1000, 500), (100000, 500)):
+                page = client.get(
+                    f"/gmail/v1/users/me/{kind}", headers=h, params={"maxResults": asked}
+                ).json()
+                assert len(page[kind]) == served, (kind, asked)
+                assert "nextPageToken" in page, (kind, asked)
+
+
 def test_gmail_attachment_size_matches_part_metadata(client, admin_h, ro_conn):
     # Real Gmail's contract: a part's body.size equals the byte length attachments.get serves, so a
     # client can stat an attachment from message metadata alone. Reporting the corpus-declared
@@ -2982,9 +3010,8 @@ def test_sheets_get_returns_grid_when_asked(base, admin_h):
     assert data["rowMetadata"] == [{"pixelSize": 21}] * 1000
     assert data["columnMetadata"] == [{"pixelSize": 100}] * 26
     rows = data["rowData"]
-    # a cell object per column of the range (26), the empty ones carrying no value — measured shape
-    assert {len(r["values"]) for r in rows} == {26}
-    assert all(c == {} for r in rows for c in r["values"][1:])
+    # the values end at the row's last cell holding a value — real shape
+    assert {len(r["values"]) for r in rows} == {1}
     assert [r["values"][0]["formattedValue"] for r in rows] == [
         "month,revenue",
         "Jan,120000",
@@ -5134,6 +5161,41 @@ def test_gmail_metadata_payload_is_mime_type_and_headers(gmail_shapes):
             assert sorted(m["payload"]) == ["headers", "mimeType"], (doc, params)
 
 
+def test_gmail_metadata_headers_keeps_the_named_headers(gmail_shapes):
+    """The rule the comment in `_gmail_message`'s `metadata` branch records, on `messages.get` and
+    on `threads.get`, and nothing changed by the parameter without `format=metadata`."""
+    client, h = gmail_shapes
+    mid = served_id("gmail", "lt")
+    url = f"/gmail/v1/users/me/messages/{mid}"
+
+    def names(params, path=url):
+        body = client.get(path, headers=h, params=params).json()
+        payload = body["messages"][0]["payload"] if "messages" in body else body["payload"]
+        return [x["name"] for x in payload["headers"]] if "headers" in payload else None
+
+    every = names({"format": "metadata"})
+    assert {"Subject", "From", "Message-ID"} <= set(every)
+    for sent, want in (
+        (["Subject"], ["Subject"]),
+        (["subject"], ["Subject"]),
+        (["MESSAGE-ID"], ["Message-ID"]),
+        (["From", "subject"], [n for n in every if n in ("Subject", "From")]),
+        (["Subject", "Subject"], ["Subject"]),
+        (["X-Nope"], None),
+        ([""], None),
+        (["", "Subject"], ["Subject"]),
+        ([" Subject"], None),
+        (["Subject "], None),
+        (["Subject,From"], None),
+    ):
+        assert names({"format": "metadata", "metadataHeaders": sent}) == want, sent
+    thread = f"/gmail/v1/users/me/threads/{mid}"
+    assert names({"format": "metadata", "metadataHeaders": "Subject"}, thread) == ["Subject"]
+    full = names({})
+    assert names({"metadataHeaders": "Subject"}) == full
+    assert len(full) > 1
+
+
 @pytest.mark.parametrize("doc", ["att", "ko", "att-ko"])
 def test_gmail_a_parts_size_is_the_byte_length_of_its_data(gmail_shapes, doc):
     """The rule `_byte_len` states, over every part of the message: `att` is ASCII, where bytes and
@@ -5374,7 +5436,7 @@ GRID_RECORDS = [
             # default grid while `AB` is column 28 of a 26-column sheet, so the two fail
             # differently -- one serves the wrong cells, the other 400s.
             {"title": "AB", "grid": [["I_AM_SHEET_AB"]]},
-            {"title": "Ragged", "grid": [["a", None, "c"]]},
+            {"title": "Ragged", "grid": [["a", None, "c"], [None], ["z"], [None, None, "w"]]},
             {"title": "Blank", "grid": []},
         ],
     },
@@ -5579,13 +5641,53 @@ def test_a_typed_cell_carries_all_three_value_fields(gc, gh, book):
     }
 
 
-def test_an_empty_cell_carries_no_value_object(gc, gh, book):
-    r = gc.get(
-        f"/sheets/v4/spreadsheets/{book}",
-        headers=gh,
-        params={"includeGridData": "true", "ranges": "Ragged!A1:C1"},
-    )
-    assert r.json()["sheets"][0]["data"][0]["rowData"][0]["values"][1] == {}
+_GRID_KEYS = ["rowData", "rowMetadata", "columnMetadata"]
+_RAGGED_ROWS = [["a", {}, "c"], {}, ["z"], [{}, {}, "w"]]
+
+
+@pytest.mark.parametrize(
+    "read, rng, keys, rows",
+    [
+        ("get", "Ragged!A1:D5", _GRID_KEYS, _RAGGED_ROWS),
+        ("filter", "Ragged!A1:D5", _GRID_KEYS, _RAGGED_ROWS),
+        ("get", "Ragged", _GRID_KEYS, _RAGGED_ROWS),
+        ("get", "Ragged!B1:D1", ["startColumn", *_GRID_KEYS], [[{}, "c"]]),
+        ("get", "Ragged!B1:D4", ["startColumn", *_GRID_KEYS], [[{}, "c"], {}, {}, [{}, "w"]]),
+        ("get", "Ragged!A2:B3", ["startRow", *_GRID_KEYS], [{}, ["z"]]),
+        ("get", "Ragged!B2:D4", ["startRow", "startColumn", *_GRID_KEYS], [{}, {}, [{}, "w"]]),
+        ("filter", "Ragged!B2:D4", ["startRow", "startColumn", *_GRID_KEYS], [{}, {}, [{}, "w"]]),
+        ("get", "Ragged!A1:B2", _GRID_KEYS, [["a"]]),
+        ("filter", "Ragged!A1:B2", _GRID_KEYS, [["a"]]),
+        ("get", "Ragged!C1:C3", ["startColumn", *_GRID_KEYS], [["c"]]),
+        ("get", "Ragged!B1:B4", ["startColumn", "rowMetadata", "columnMetadata"], []),
+        ("get", "Blank", ["rowMetadata", "columnMetadata"], []),
+        ("filter", "Blank", ["rowMetadata", "columnMetadata"], []),
+    ],
+)
+def test_a_grid_data_block_serves_reals_keys_and_rows(gc, gh, book, read, rng, keys, rows):
+    """Each block as real Sheets served it from a sheet laid out like `Ragged` or `Blank`,
+    measured as `_sheets_grid_data` records. A cell is written here as its `formattedValue`, and an
+    empty cell or a row holding no value as the `{}` served for it."""
+    if read == "get":
+        r = gc.get(
+            f"/sheets/v4/spreadsheets/{book}",
+            headers=gh,
+            params={"includeGridData": "true", "ranges": rng},
+        )
+    else:
+        r = gc.post(
+            f"/sheets/v4/spreadsheets/{book}:getByDataFilter",
+            headers=gh,
+            json={"dataFilters": [{"a1Range": rng}], "includeGridData": True},
+        )
+    assert r.status_code == 200, r.text
+    block = r.json()["sheets"][0]["data"][0]
+    assert list(block) == keys
+    got = [
+        [c["formattedValue"] if c else {} for c in row["values"]] if "values" in row else row
+        for row in block.get("rowData", [])
+    ]
+    assert got == rows
 
 
 @pytest.mark.parametrize(
@@ -5682,10 +5784,9 @@ def test_include_grid_data_without_ranges_gives_every_sheet_its_own_cells(gc, gh
     got = {}
     for s in r.json()["sheets"]:
         rows = s["data"][0].get("rowData", [])
-        # Each row is padded to the grid's width with empty cell objects, which real Sheets does
-        # too; the occupied prefix is what says which sheet answered.
+        # The cells holding a value are what say which sheet answered; an empty one is `{}`.
         got[s["properties"]["title"]] = [
-            [v["formattedValue"] for v in row["values"] if v] for row in rows
+            [v["formattedValue"] for v in row.get("values", []) if v] for row in rows
         ]
     assert got["A1"] == [["I_AM_SHEET_A1"]]
     assert got["AB"] == [["I_AM_SHEET_AB"]]
@@ -5740,17 +5841,6 @@ def test_ranges_without_include_grid_data_still_filters_and_serves_no_cells(gc, 
     sheets = r.json()["sheets"]
     assert [s["properties"]["title"] for s in sheets] == ["Summary"]
     assert "data" not in sheets[0]
-
-
-def test_an_empty_sheet_omits_row_data_entirely(gc, gh, book):
-    """Measured: an empty sheet's GridData block carries its metadata and no `rowData` key at all,
-    not an empty list."""
-    r = gc.get(
-        f"/sheets/v4/spreadsheets/{book}",
-        headers=gh,
-        params={"includeGridData": "true", "ranges": "Blank"},
-    )
-    assert "rowData" not in r.json()["sheets"][0]["data"][0]
 
 
 # --- Drive export must keep agreeing with the Sheets API --------------------------------------
@@ -6397,3 +6487,43 @@ def test_a_grid_range_member_is_checked_before_it_reaches_the_parser(
 ):
     r = _by_filter(gc, gh, book, {"dataFilters": [{"gridRange": grid_range}]})
     assert r.status_code == status, r.text
+
+
+@pytest.mark.parametrize(
+    "title,content",
+    [("ASCII", "hello there"), ("ASCII", "안녕하세요"), ("회의 일정", "😀 café")],
+)
+def test_gmail_size_estimate_matches_raw_bytes_in_every_format(tmp_path, title, content):
+    """The `sizeEstimate` rule in `_byte_len`, under every `format` and in the thread. A non-ASCII
+    body reaches `raw` transfer-encoded into ASCII, so the subject is what puts bytes there that a
+    character count would miss.
+    """
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "doc_id": "size",
+                "mailbox": "owner",
+                "title": title,
+                "author_email": "owner@example.com",
+                "created": "2026-10-01T00:00:00Z",
+                "content": content,
+            }
+        ],
+    )
+    with client_for(s) as c:
+        h = {"Authorization": "Bearer " + yaml.safe_load(s.tokens_path.read_text())["admin_token"]}
+        mid = c.get("/gmail/v1/users/me/messages", headers=h).json()["messages"][0]["id"]
+        path = "/gmail/v1/users/me/messages/" + mid
+        raw = c.get(path + "?format=raw", headers=h).json()
+        encoded = raw["raw"]
+        size = len(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        assert raw["sizeEstimate"] == size
+        for fmt in ["minimal", "metadata", "full"]:
+            message = c.get(path + "?format=" + fmt, headers=h).json()
+            assert message["sizeEstimate"] == size
+            tid = message["threadId"]
+            thread = c.get(f"/gmail/v1/users/me/threads/{tid}?format={fmt}", headers=h)
+            assert thread.status_code == 200
+            assert thread.json()["messages"][0]["sizeEstimate"] == size
