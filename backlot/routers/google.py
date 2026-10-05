@@ -1018,7 +1018,7 @@ def _gmail_message(
     html = row["body_html"] or f"<html><body><p>{row['content']}</p></body></html>"
     nodes = _mime_tree(row, html, attachments)
     mime_body = _mime_multipart(nodes, boundary, row["id"])
-    raw = "\r\n".join(f"{h['name']}: {h['value']}" for h in headers) + "\r\n\r\n" + mime_body
+    raw = _raw_header_block(headers) + "\r\n\r\n" + mime_body
     msg["sizeEstimate"] = _byte_len(raw)
     if fmt == "minimal":
         return msg
