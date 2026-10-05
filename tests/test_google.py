@@ -4836,6 +4836,53 @@ def test_gmail_raw_and_headers(tmp_path):
     assert plain_parts and plain_parts[0].get_payload(decode=True).decode() == "body text"
 
 
+def test_gmail_raw_encodes_non_ascii_headers(tmp_path):
+    """`raw` is ASCII RFC 2047; `full` payload headers stay decoded. #472"""
+    import base64
+    import email
+    import email.header
+
+    from backlot.routers.google import _gmail_message
+
+    s = tiny_corpus(
+        tmp_path,
+        [
+            {
+                "source_type": "gmail",
+                "doc_id": "ko",
+                "mailbox": "ceo",
+                "title": "회의 일정",
+                "author_email": "ceo@example.com",
+                "to": "회의 <peer@example.com>",
+                "content": "see attached",
+                "attachments": [
+                    {"filename": "회의록.pdf", "mime": "application/pdf", "content": "pdf"}
+                ],
+            },
+        ],
+    )
+    conn = store.connect_ro(s.db_path)
+    row = store.get_document(conn, "gmail", served_id("gmail", "ko"))
+    raw_bytes = base64.urlsafe_b64decode(_gmail_message(row, "raw")["raw"])
+    assert raw_bytes.isascii()
+    msg = email.message_from_bytes(raw_bytes)
+    assert not msg.defects, msg.defects
+    subject = email.header.decode_header(msg["Subject"])
+    assert subject == [(b"\xed\x9a\x8c\xec\x9d\x98 \xec\x9d\xbc\xec\xa0\x95", "utf-8")]
+    att = next(p for p in msg.walk() if p.get_content_disposition() == "attachment")
+    filename = email.header.decode_header(att.get_filename())
+    assert filename[0][0].decode(filename[0][1] or "utf-8") == "회의록.pdf"
+    # payload headers are the decoded text real serves under `full`
+    full = _gmail_message(row, "full")
+    headers = {h["name"]: h["value"] for h in full["payload"]["headers"]}
+    assert headers["Subject"] == "회의 일정"
+    assert headers["To"] == "회의 <peer@example.com>"
+    part = next(p for p in full["payload"]["parts"] if p["filename"])
+    assert part["filename"] == "회의록.pdf"
+    ctype = next(h["value"] for h in part["headers"] if h["name"] == "Content-Type")
+    assert 'name="회의록.pdf"' in ctype
+
+
 def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
     from backlot.routers.google import _gmail_message
 
