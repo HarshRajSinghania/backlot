@@ -1,0 +1,149 @@
+diff --git a/backlot/routers/google.py b/backlot/routers/google.py
+index eac14f6..bc59b7a 100644
+--- a/backlot/routers/google.py
++++ b/backlot/routers/google.py
+@@ -729,6 +729,68 @@ def _header(name: str, value: str) -> dict:
+     return {"name": name, "value": value}
+ 
+ 
++# RFC 2047 encoded-word budget is 75 octets. `=?UTF-8?B?` + `?=` leaves 63, and base64 length
++# must be a multiple of 4, so 60 chars / 45 UTF-8 bytes per word. Adjacent words are separated
++# by a space, which a decoder discards (RFC 2047 §6.2).
++_ENCODED_WORD_BYTES = 45
++
++
++def _encoded_words(text: str) -> str:
++    """UTF-8 `B` encoded-words for non-ASCII header text, as a measured Gmail `raw` writes them."""
++    raw = text.encode("utf-8")
++    words = []
++    for i in range(0, len(raw), _ENCODED_WORD_BYTES):
++        b64 = base64.b64encode(raw[i : i + _ENCODED_WORD_BYTES]).decode("ascii")
++        words.append(f"=?UTF-8?B?{b64}?=")
++    return " ".join(words)
++
++
++def _raw_header_value(name: str, value: str) -> str:
++    """Serialize one header for `format=raw`.
++
++    Real Gmail's `raw` is ASCII. A measurement on 2026-10-05 (web-composed message, Hangul subject
++    and attachment name) wrote the subject as a UTF-8 encoded-word and the attachment `name=` /
++    `filename=` as an encoded-word inside the existing quotes. `payload.headers` under `full` and
++    `metadata` stay decoded, so this runs only when building the raw message. `To`, `Cc`,
++    `Reply-To` and a `From` display name were not in that measurement; non-ASCII there is encoded
++    the same way, leaving angle-addrs untouched, so `raw` stays ASCII without rewriting addresses.
++    """
++    if value.isascii():
++        return value
++    if name.lower() in {"content-type", "content-disposition"}:
++
++        def quoted(match: re.Match) -> str:
++            inner = match.group(1)
++            if inner.isascii():
++                return match.group(0)
++            return f'"{_encoded_words(inner)}"'
++
++        return re.sub(r'"([^"]*)"', quoted, value)
++    if name.lower() in {"from", "to", "cc", "bcc", "reply-to", "delivered-to"}:
++
++        def phrase(match: re.Match) -> str:
++            return _encoded_words(match.group(0))
++
++        parts = []
++        for part in re.split(r"(<[^>]*>)", value):
++            if part.startswith("<") or part.isascii():
++                parts.append(part)
++            else:
++                parts.append(
++                    re.sub(
++                        r"[^\x00-\x7f](?:[^\x00-\x7f]| )*[\x00-\x7f]|[^\x00-\x7f]",
++                        phrase,
++                        part,
++                    )
++                )
++        return "".join(parts)
++    return _encoded_words(value)
++
++
++def _raw_header_block(headers: list[dict]) -> str:
++    return "\r\n".join(f"{h['name']}: {_raw_header_value(h['name'], h['value'])}" for h in headers)
++
++
+ def _text_node(mime: str, data: str, encoding: str | None) -> dict:
+     """A text leaf, sent in `encoding` (None: as it is, with no `Content-Transfer-Encoding`)."""
+     headers = [_header("Content-Type", f'{mime}; charset="UTF-8"')]
+@@ -834,7 +896,7 @@ def _json_part(node: dict, part_id: str, message_id: str) -> dict:
+ 
+ def _mime_part(node: dict, message_id: str) -> str:
+     """One node of `_mime_tree` as a MIME entity, encoded as its own headers declare."""
+-    head = "\r\n".join(f"{h['name']}: {h['value']}" for h in node["headers"])
++    head = _raw_header_block(node["headers"])
+     if "parts" in node:
+         body = _mime_multipart(node["parts"], node["boundary"], message_id)
+     elif "attachment" in node:
+@@ -949,7 +1011,7 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
+         # (llama-index's GmailReader) choke because `get_payload()` degrades to a bare
+         # string instead of a list of sub-messages). Built from the same parts `full` serves.
+         mime_body = _mime_multipart(nodes, boundary, row["id"])
+-        raw = "\r\n".join(f"{h['name']}: {h['value']}" for h in headers) + "\r\n\r\n" + mime_body
++        raw = _raw_header_block(headers) + "\r\n\r\n" + mime_body
+         msg["raw"] = _b64url(raw)
+         return msg
+ 
+diff --git a/tests/test_google.py b/tests/test_google.py
+index e3cc37e..f12b16b 100644
+--- a/tests/test_google.py
++++ b/tests/test_google.py
+@@ -4836,6 +4836,53 @@ def test_gmail_raw_and_headers(tmp_path):
+     assert plain_parts and plain_parts[0].get_payload(decode=True).decode() == "body text"
+ 
+ 
++def test_gmail_raw_encodes_non_ascii_headers(tmp_path):
++    """`raw` is ASCII RFC 2047; `full` payload headers stay decoded. #472"""
++    import base64
++    import email
++    import email.header
++
++    from backlot.routers.google import _gmail_message
++
++    s = tiny_corpus(
++        tmp_path,
++        [
++            {
++                "source_type": "gmail",
++                "doc_id": "ko",
++                "mailbox": "ceo",
++                "title": "회의 일정",
++                "author_email": "ceo@example.com",
++                "to": "회의 <peer@example.com>",
++                "content": "see attached",
++                "attachments": [
++                    {"filename": "회의록.pdf", "mime": "application/pdf", "content": "pdf"}
++                ],
++            },
++        ],
++    )
++    conn = store.connect_ro(s.db_path)
++    row = store.get_document(conn, "gmail", served_id("gmail", "ko"))
++    raw_bytes = base64.urlsafe_b64decode(_gmail_message(row, "raw")["raw"])
++    assert raw_bytes.isascii()
++    msg = email.message_from_bytes(raw_bytes)
++    assert not msg.defects, msg.defects
++    subject = email.header.decode_header(msg["Subject"])
++    assert subject == [(b"\xed\x9a\x8c\xec\x9d\x98 \xec\x9d\xbc\xec\xa0\x95", "utf-8")]
++    att = next(p for p in msg.walk() if p.get_content_disposition() == "attachment")
++    filename = email.header.decode_header(att.get_filename())
++    assert filename[0][0].decode(filename[0][1] or "utf-8") == "회의록.pdf"
++    # payload headers are the decoded text real serves under `full`
++    full = _gmail_message(row, "full")
++    headers = {h["name"]: h["value"] for h in full["payload"]["headers"]}
++    assert headers["Subject"] == "회의 일정"
++    assert headers["To"] == "회의 <peer@example.com>"
++    part = next(p for p in full["payload"]["parts"] if p["filename"])
++    assert part["filename"] == "회의록.pdf"
++    ctype = next(h["value"] for h in part["headers"] if h["name"] == "Content-Type")
++    assert 'name="회의록.pdf"' in ctype
++
++
+ def test_gmail_raw_with_attachment_is_valid_mime(tmp_path):
+     from backlot.routers.google import _gmail_message
+ 
