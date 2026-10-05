@@ -17,6 +17,7 @@ import quopri
 import re
 import string
 from email.parser import BytesParser
+from email.utils import formataddr, getaddresses
 from http import HTTPStatus
 from typing import NamedTuple
 
@@ -730,30 +731,44 @@ def _header(name: str, value: str) -> dict:
 
 
 # RFC 2047 encoded-word budget is 75 octets. `=?UTF-8?B?` + `?=` leaves 63, and base64 length
-# must be a multiple of 4, so 60 chars / 45 UTF-8 bytes per word. Adjacent words are separated
-# by a space, which a decoder discards (RFC 2047 §6.2).
+# must be a multiple of 4, so 60 chars / 45 UTF-8 bytes per word. RFC 2047 §5 keeps a multi-octet
+# character within one word, so a word ends at the last whole character inside those 45 bytes.
+# Adjacent words are separated by a space, which a decoder discards (RFC 2047 §6.2).
 _ENCODED_WORD_BYTES = 45
 
 
 def _encoded_words(text: str) -> str:
-    """UTF-8 `B` encoded-words for non-ASCII header text, as a measured Gmail `raw` writes them."""
-    raw = text.encode("utf-8")
-    words = []
-    for i in range(0, len(raw), _ENCODED_WORD_BYTES):
-        b64 = base64.b64encode(raw[i : i + _ENCODED_WORD_BYTES]).decode("ascii")
-        words.append(f"=?UTF-8?B?{b64}?=")
-    return " ".join(words)
+    """`text` as UTF-8 `B` encoded-words, as many as `_ENCODED_WORD_BYTES` needs."""
+    chunks = [b""]
+    for char in text:
+        encoded = char.encode("utf-8")
+        if len(chunks[-1]) + len(encoded) > _ENCODED_WORD_BYTES:
+            chunks.append(b"")
+        chunks[-1] += encoded
+    return " ".join(f"=?UTF-8?B?{base64.b64encode(c).decode('ascii')}?=" for c in chunks)
+
+
+def _raw_mailbox(display: str, address: str) -> str:
+    """One mailbox of an address header, for `_raw_header_value`: only the display name is
+    encoded, since RFC 2047 §5 keeps encoded-words out of an addr-spec."""
+    if not display.isascii():
+        return f"{_encoded_words(display)} <{address}>"
+    if not address.isascii():
+        # `formataddr` refuses a non-ASCII address
+        return f"{display} <{address}>" if display else address
+    return formataddr((display, address))
 
 
 def _raw_header_value(name: str, value: str) -> str:
-    """Serialize one header for `format=raw`.
+    """One header's value as `format=raw` writes it. `payload.headers` under `full` and
+    `metadata` serve the value as it is.
 
-    Real Gmail's `raw` is ASCII. A measurement on 2026-10-05 (web-composed message, Hangul subject
-    and attachment name) wrote the subject as a UTF-8 encoded-word and the attachment `name=` /
-    `filename=` as an encoded-word inside the existing quotes. `payload.headers` under `full` and
-    `metadata` stay decoded, so this runs only when building the raw message. `To`, `Cc`,
-    `Reply-To` and a `From` display name were not in that measurement; non-ASCII there is encoded
-    the same way, leaving angle-addrs untouched, so `raw` stays ASCII without rewriting addresses.
+    Measured on 2026-10-05, on a message composed in the Gmail web client: real's `raw` is ASCII. It
+    writes the subject as a UTF-8 `B` encoded-word, a Hangul display name in `From` and `To` as one
+    encoded-word before the ASCII `<address>`, with no quotes, and the attachment's `name=` and
+    `filename=` as encoded-words inside their quotes. `Cc`, `Bcc` and `Reply-To` were not measured
+    and are written the way `To` is; any other header is encoded whole, as the subject is. A
+    non-ASCII address is written as it is (see `_raw_mailbox`), so it stays non-ASCII in `raw`.
     """
     if value.isascii():
         return value
@@ -767,23 +782,9 @@ def _raw_header_value(name: str, value: str) -> str:
 
         return re.sub(r'"([^"]*)"', quoted, value)
     if name.lower() in {"from", "to", "cc", "bcc", "reply-to", "delivered-to"}:
-
-        def phrase(match: re.Match) -> str:
-            return _encoded_words(match.group(0))
-
-        parts = []
-        for part in re.split(r"(<[^>]*>)", value):
-            if part.startswith("<") or part.isascii():
-                parts.append(part)
-            else:
-                parts.append(
-                    re.sub(
-                        r"[^\x00-\x7f](?:[^\x00-\x7f]| )*[^\x00-\x7f]|[^\x00-\x7f]",
-                        phrase,
-                        part,
-                    )
-                )
-        return "".join(parts)
+        mailboxes = getaddresses([value])
+        if all("@" in address for _, address in mailboxes):
+            return ", ".join(_raw_mailbox(display, address) for display, address in mailboxes)
     return _encoded_words(value)
 
 
@@ -1011,7 +1012,7 @@ def _gmail_message(row, fmt: str, caller_email: str | None = None) -> dict:
         # (llama-index's GmailReader) choke because `get_payload()` degrades to a bare
         # string instead of a list of sub-messages). Built from the same parts `full` serves.
         mime_body = _mime_multipart(nodes, boundary, row["id"])
-        raw = _raw_header_block(headers) + "\r\n\r\n" + mime_body
+        raw = "\r\n".join(f"{h['name']}: {h['value']}" for h in headers) + "\r\n\r\n" + mime_body
         msg["raw"] = _b64url(raw)
         return msg
 
