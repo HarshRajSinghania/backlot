@@ -382,9 +382,19 @@ def test_jira_serverinfo_answers_reals_fifteen_members_on_v2_and_v3(client, admi
     }
     assert re.fullmatch(r"[0-9a-f]{40}", synthesized["scmInfo"])
     built = synthesized["buildDate"]
-    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d{4}", built)
-    served = datetime.fromisoformat(synthesized["serverTime"])
+    stamp = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d{4}"
+    assert re.fullmatch(stamp, built)
+    # signed-in serverTime is Jira's +HHMM form, not RFC3339 Z (measured 2026-10-05)
+    assert re.fullmatch(stamp, synthesized["serverTime"])
+    served = datetime.strptime(synthesized["serverTime"], "%Y-%m-%dT%H:%M:%S.%f%z")
     assert datetime.strptime(built, "%Y-%m-%dT%H:%M:%S.%f%z") < served
+
+    # no credential: the same body without serverTime, on both versions (measured 2026-10-05)
+    for ver in ("2", "3"):
+        anon = client.get(f"/atlassian/rest/api/{ver}/serverInfo").json()
+        assert "serverTime" not in anon
+        assert anon.keys() == v3.keys() | {"buildDate", "scmInfo"}
+        assert {k: anon[k] for k in v3} == v3
 
 
 def test_jira_search_filtered_by_project(client, admin_h):
