@@ -298,14 +298,20 @@ def _resolve_jira_key(request: Request, conn, key: str, ids):
 )  # jira PyPI client probes this on connect
 @router.get("/rest/api/3/serverInfo", response_model=JiraServerInfo)
 async def jira_server_info(request: Request):
-    """The fifteen members Jira Cloud answers a signed-in caller, the same on v2 and v3 (measured
-    2026-10-03 and 2026-10-05). The four display URLs are the site's URL, `serverTitle` is `Jira`,
-    and the version and build number are the ones that site served. `scmInfo` is a synthesized
-    40-hex commit id, and `buildDate` a day before `serverTime`, since a build precedes the server
-    running it."""
+    """The members Jira Cloud answers, the same on v2 and v3 (measured 2026-10-03 and 2026-10-05).
+
+    A signed-in caller gets fifteen, including `serverTime`. A caller with no credential gets the
+    same fourteen and no `serverTime` — measured on one Cloud tenant on 2026-10-05, once with a
+    user's API token and once with no `Authorization` header. `serverTime` is milliseconds and a
+    `+HHMM` offset, the form `buildDate` already takes (`synth.jira_datetime`); the tenant wrote
+    `+0900` while `serverTimeZone` was `Etc/UTC`, so the offset is the tenant's and here, where
+    that zone is `Etc/UTC`, it is `+0000`. The four display URLs are the site's URL, `serverTitle`
+    is `Jira`, and the version and build number are the ones that site served. `scmInfo` is a
+    synthesized 40-hex commit id, and `buildDate` a day before `serverTime`, since a build
+    precedes the server running it."""
     site = _site(request)
     ts = synth.epoch("serverInfo")
-    return {
+    body = {
         "baseUrl": site,
         "displayUrl": site,
         "displayUrlServicedeskHelpCenter": site,
@@ -316,12 +322,14 @@ async def jira_server_info(request: Request):
         "deploymentType": "Cloud",
         "buildNumber": 100294,
         "buildDate": synth.jira_datetime(ts - 86400),
-        "serverTime": synth.rfc3339_millis(ts),
         "scmInfo": hashlib.sha1(b"serverInfo").hexdigest(),
         "serverTitle": "Jira",
         "defaultLocale": {"locale": "en_US"},
         "serverTimeZone": "Etc/UTC",
     }
+    if not auth.atlassian_caller(request).is_anonymous:
+        body["serverTime"] = synth.jira_datetime(ts)
+    return body
 
 
 def _reachable_projects(conn, ids) -> list:
