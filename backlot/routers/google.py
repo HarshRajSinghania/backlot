@@ -2313,7 +2313,10 @@ async def drive_files_permissions(file_id: str, request: Request):
         request, "supportsAllDrives", "supportsTeamDrives", "useDomainAdminAccess", page_size=True
     )["pageSize"]
     _drive_page_size_in_range(sizes, 100)
-    _drive_listing_page_token(request, expired_empty=True)
+    # Empty is still real's 403 pageTokenExpired (measured 2026-10-05, before this route issued
+    # tokens). A non-empty token is an offset this route issued, refused like files.list when it
+    # is not. Checked ahead of the file lookup, as the old whole-list refusal was.
+    offset = _drive_permissions_page_token(request)
     # No caller here is a domain administrator: 404 for the file, even one the caller owns,
     # measured 2026-10-04 on a consumer account and 2026-10-06 on a Workspace member.
     if _drive_true(request, "useDomainAdminAccess"):
@@ -2327,11 +2330,10 @@ async def drive_files_permissions(file_id: str, request: Request):
         name = _drive_folder_name_by_id(conn, file_id)
         if name is None:
             raise gerr.not_found_file(file_id)
-        return {
-            "kind": "drive#permissionList",
-            "permissions": _drive_permissions(conn, file_id, folder=name),
-        }
-    return {"kind": "drive#permissionList", "permissions": _drive_permissions(conn, row["id"])}
+        permissions = _drive_permissions(conn, file_id, folder=name)
+    else:
+        permissions = _drive_permissions(conn, row["id"])
+    return _drive_permission_page(permissions, sizes, offset)
 
 
 # --- Google Workspace editors read APIs (Docs / Sheets / Slides) ------------------
@@ -4467,29 +4469,56 @@ def _drive_page_size_in_range(sizes: list[int], top: int) -> None:
         )
 
 
-def _drive_listing_page_token(request: Request, *, expired_empty: bool = False) -> None:
-    """Refuse a `pageToken` sent to a listing that issues no `nextPageToken`, where every token is
-    one it did not issue: `permissions.list`, which serves a file's whole sharing on one page, and
-    `drives.list`, which is empty. Presence is the whole test: `decode_cursor_or_none`, which
-    `files.list` calls, reads `bzow` and that route's own tokens as offsets. Read from the first
-    repeat, after the typed and range refusals and ahead of the `useDomainAdminAccess=true` refusal
-    and `permissions.list`'s file lookup. Measured 2026-10-04 and 2026-10-05, and the empty, `bad`,
-    `bzow`, `BOGUS` and issued-token cells again on 2026-10-07 as a Workspace member::
+def _drive_permissions_page_token(request: Request) -> int:
+    """The offset `permissions.list` should start at.
 
-        pageToken                         permissions.list          drives.list
-        --------------------------------|-------------------------|-------------------------
-        empty                           | 403 `pageTokenExpired`  | the first page
-        `bad`, `bzow`, `AAAA`           | 400 `Invalid Value`     | 400 `Invalid Value`
-        `BOGUS`, `0`, `a`, a space, a   | 500 `Unknown Error.`    | 400 `Invalid Value`
-        token `files.list` issued       |                         |
-
-    ``expired_empty`` asks for the empty row's 403, which only `permissions.list` answers. The 500
-    is not modelled; those tokens get the 400 here too."""
+    An omitted token is the first page. An empty one is real's 403 `pageTokenExpired`, measured
+    2026-10-05 while this route still served every permission on one page and left unchanged: the
+    measured table does not say an empty token becomes the first page once the route pages.
+    Anything else is an offset this route issued, or 400 `Invalid Value` — the same rule
+    `files.list` uses for a token it did not issue. `bzow` decodes as offset 0, so it is the first
+    page, as on `files.list`. A `files.list` token uses the same offset cursor and is an offset
+    rather than the 500 real answered a foreign token with before this route issued any.
+    """
     token = gerr.first_repeat(request.query_params, "pageToken")
     if token is None:
-        return
-    if not token and expired_empty:
+        return 0
+    if not token:
         raise gerr.page_token_expired()
+    offset = decode_cursor_or_none(token)
+    if offset is None:
+        raise gerr.invalid_value("pageToken")
+    return offset
+
+
+def _drive_permission_page(permissions: list[dict], sizes: list[int], offset: int) -> dict:
+    """One page of a file's permissions, in the unpaged list's order.
+
+    Measured 2026-10-05 on two-permission My Drive files: no `pageSize` is the whole list and no
+    `nextPageToken`; `pageSize=1` is the first permission and a token that serves the other one;
+    `pageSize` of 2, 3 or 100 is both and no token. Discovery's maximum is 100, already refused
+    above that by `_drive_page_size_in_range`. The first of several `pageSize` values is the one
+    `_drive_typed` parsed, matching `files.list`.
+    """
+    if not sizes:
+        return {"kind": "drive#permissionList", "permissions": permissions[offset:]}
+    size = sizes[0]
+    page = permissions[offset : offset + size]
+    body = {"kind": "drive#permissionList", "permissions": page}
+    token = next_page_token(offset, len(page), len(permissions))
+    if token:
+        body["nextPageToken"] = token
+    return body
+
+
+def _drive_listing_page_token(request: Request) -> None:
+    """Refuse a `pageToken` sent to `drives.list`, which is empty and issues no `nextPageToken`,
+    so every token is one it did not issue. Presence is the whole test: an empty token is the
+    first page, and any other is 400 `Invalid Value`. Read from the first repeat, after the typed
+    and range refusals and ahead of the `useDomainAdminAccess=true` refusal. Measured 2026-10-04
+    and 2026-10-05, and again on 2026-10-07 as a Workspace member. `permissions.list` used to share
+    this refusal and now pages; see `_drive_permissions_page_token`."""
+    token = gerr.first_repeat(request.query_params, "pageToken")
     if token:
         raise gerr.invalid_value("pageToken")
 

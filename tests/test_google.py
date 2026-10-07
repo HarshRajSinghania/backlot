@@ -1330,13 +1330,16 @@ _TOKEN_EXPIRED = {
             for path in (_PERMS, "/drive/v3/drives")
             for query, error in [
                 ([("pageToken", "bad")], _TOKEN_INVALID),
-                ([("pageToken", "bzow")], _TOKEN_INVALID),
                 ([("useDomainAdminAccess", "true"), ("pageToken", "bad")], _TOKEN_INVALID),
                 ([("pageToken", "bad"), ("useDomainAdminAccess", "true")], _TOKEN_INVALID),
                 ([("pageToken", "bad"), ("pageSize", "0")], None),
                 ([("pageToken", "bad"), ("useDomainAdminAccess", "NOPE")], None),
             ]
         ],
+        # drives.list still issues no token, so bzow is 400. permissions.list pages, and bzow
+        # decodes as offset 0 — the same cursor files.list accepts — so it is the first page.
+        ("/drive/v3/drives", [("pageToken", "bzow")], _TOKEN_INVALID),
+        (_PERMS, [("pageToken", "bzow")], None),
         (_PERMS, [("pageToken", "")], _TOKEN_EXPIRED),
         (_PERMS, [("useDomainAdminAccess", "true"), ("pageToken", "")], _TOKEN_EXPIRED),
         ("/drive/v3/files/nosuchfileid000000/permissions", [("pageToken", "")], _TOKEN_EXPIRED),
@@ -1358,6 +1361,39 @@ def test_drive_a_listing_that_issues_no_page_token_refuses_one(client, admin_h, 
         assert r.content == client.get(url, headers=admin_h, params=without).content
     else:
         assert (r.status_code, _gerr(r)) == (error["code"], error)
+
+
+def test_drive_permissions_list_pages_by_page_size(client, admin_h):
+    """`permissions.list` pages the unpaged list. Measured 2026-10-05: no pageSize is the whole
+    list and no nextPageToken; pageSize=1 is the first permission and a token for the rest;
+    pageSize of 2 or 100 is the whole list. Issue #481."""
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    url = f"/drive/v3/files/{doc}/permissions"
+    whole = client.get(url, headers=admin_h)
+    assert whole.status_code == 200
+    permissions = whole.json()["permissions"]
+    assert len(permissions) >= 2
+    assert "nextPageToken" not in whole.json()
+    first = client.get(url, headers=admin_h, params={"pageSize": 1})
+    assert first.status_code == 200
+    body = first.json()
+    assert body["permissions"] == permissions[:1]
+    assert "nextPageToken" in body
+    second = client.get(
+        url, headers=admin_h, params={"pageSize": 1, "pageToken": body["nextPageToken"]}
+    )
+    assert second.status_code == 200
+    assert second.json()["permissions"] == permissions[1:2]
+    assert "nextPageToken" not in second.json() or len(permissions) > 2
+    both = client.get(url, headers=admin_h, params={"pageSize": 2})
+    assert both.status_code == 200
+    assert both.json()["permissions"] == permissions[:2]
+    if len(permissions) <= 2:
+        assert "nextPageToken" not in both.json()
+    capped = client.get(url, headers=admin_h, params={"pageSize": 100})
+    assert capped.status_code == 200
+    assert capped.json()["permissions"] == permissions
+    assert "nextPageToken" not in capped.json()
 
 
 @pytest.mark.parametrize(
