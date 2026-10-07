@@ -161,6 +161,17 @@ def _flag(raw) -> bool:
     return str(raw or "").strip().lower() in {"true", "1", "yes"}
 
 
+def _first_query(qp, name: str):
+    """The first value of a repeated query key.
+
+    Measured against api.hubapi.com on 2026-10-07: a listing that sends `archived` more than once
+    is the view the first value names. Starlette's `QueryParams.get` returns the last, so the
+    listing must read `getlist` and take the first element (an absent key is still un-archived).
+    """
+    values = qp.getlist(name)
+    return values[0] if values else None
+
+
 def _props(row) -> dict:
     return store.jcol(row, "properties", {}) or {}
 
@@ -759,7 +770,7 @@ async def list_objects(object_type: str, request: Request):
         after_id=after_doc,
         visible_ids=auth.visible_ids(request, caller),
         limit=limit + 1,
-        archived=_flag(qp.get("archived")),
+        archived=_flag(_first_query(qp, "archived")),
     )
     return _page(rows, limit, _keep(qp.get("properties")))
 
