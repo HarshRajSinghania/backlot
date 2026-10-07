@@ -10,8 +10,10 @@ envelope is NOT uniform — three families differ in which optional members they
 
     family                  errors[]           status               no Authorization header, GET
     ------------------------|------------------|---------------------|-----------------------------
-    Drive v3                | always           | auth failures and   | 403 PERMISSION_DENIED
-                            |                  | typed values only   |
+    Drive v3                | always           | auth failures,      | 403 PERMISSION_DENIED
+                            |                  | typed values,       |
+                            |                  | `$.xgafv` and the   |
+                            |                  | batch redirect only |
     Gmail v1                | unless $.xgafv=2 | always              | 401 UNAUTHENTICATED
     Docs v1 / Slides v1     | $.xgafv=1        | always              | 401 UNAUTHENTICATED
     Sheets v4               | $.xgafv=1        | always              | 403 PERMISSION_DENIED
@@ -62,9 +64,9 @@ from collections.abc import Mapping
 from fastapi import HTTPException, Request, Response
 
 DRIVE, GMAIL, EDITOR = "drive", "gmail", "editor"
-# `status` needs no per-family flag: Drive's parameter failures other than a typed value simply do
-# not have one, while every Gmail and editor error does, so "the error carries a status" is the
-# whole condition.
+# `status` needs no per-family flag: each constructor passes one exactly where the module
+# docstring's table says its family carries one, so "the error carries a status" is the whole
+# condition.
 _PREFIX_FAMILY = (
     ("/drive/v3", DRIVE),
     ("/gmail/v1", GMAIL),
@@ -196,6 +198,57 @@ def not_downloadable() -> GoogleError:
         "Only files with binary content can be downloaded. Use Export with Docs Editors files.",
         reason="fileNotDownloadable",
         location="alt",
+    )
+
+
+def supports_all_drives_required() -> GoogleError:
+    """`files.list` asked for shared-drive items without saying it supports shared drives. No
+    `location` and no `status`, measured 2026-10-04."""
+    return GoogleError(
+        403,
+        "The supportsAllDrives parameter was not set to true.",
+        reason="supportsTeamDrivesRequired",
+    )
+
+
+def domain_admin_privilege_required() -> GoogleError:
+    """`drives.list` asked for a domain administrator's access, from a Workspace member who is not
+    one. No `location` and no `status`, measured 2026-10-06."""
+    return GoogleError(
+        403,
+        "The requesting user does not have the administrator privilege required to list or manage "
+        "all shared drives.",
+        reason="noListTeamDrivesAdministratorPrivilege",
+    )
+
+
+def abuse_acknowledgment_not_applicable() -> GoogleError:
+    """`files.get` acknowledged abuse on a read that downloads nothing. Measured 2026-10-04."""
+    return GoogleError(
+        403,
+        "The acknowledgeAbuse parameter is only applicable for download requests.",
+        reason="invalidAbuseAcknowledgment",
+        location="acknowledgeAbuse",
+    )
+
+
+def download_redirect(location: str) -> GoogleError:
+    """A Drive download inside a batch, redirected rather than answered -- see
+    ``routers.google._drive_batch_redirect``. Measured 2026-10-04: a 302 carrying ``Location`` and
+    this error body."""
+    exc = GoogleError(302, "Unknown Error.", reason="backendError", status="UNKNOWN")
+    exc.headers = {"Location": location}
+    return exc
+
+
+def unimplemented() -> GoogleError:
+    """A Sheets read inside a batch. Measured 2026-10-04, its `errors[]` entry, shown at
+    `$.xgafv=1`, is ``notImplemented`` under ``global``."""
+    return GoogleError(
+        501,
+        "Operation is not implemented, or supported, or enabled.",
+        reason="notImplemented",
+        status="UNIMPLEMENTED",
     )
 
 
@@ -561,7 +614,7 @@ def jsonp_callback(request: Request) -> str | None:
     return first_repeat(query, CALLBACK) or None
 
 
-def validate_system_parameters(request: Request) -> None:
+def validate_system_parameters(request: Request, *, callback: bool = True) -> None:
     """Refuse a `$.xgafv` other than `1` or `2`, or a `callback` that cannot be a JavaScript name,
     on a Google-family path, before the route runs.
 
@@ -571,19 +624,25 @@ def validate_system_parameters(request: Request) -> None:
     because it beats `callback` too -- measured, `callback=a b&$.xgafv=9` answers the `$.xgafv`
     sentence, wrapped through the very name the other check would have refused. The batch endpoint
     is not a family path and is left alone.
+
+    ``callback=False`` leaves `callback` alone: it is not checked, and no refusal, the `$.xgafv` one
+    included, is wrapped through it. The caller decides when, since which requests real exempts is a
+    question about the route.
     """
     if family(request.url.path) is None:
         return
-    # That this ran at all is what :func:`rendered` needs to know, and only this call can say so:
-    # a ROUTER dependency runs once a route has matched, so an unrouted family path reaches the
-    # renderer with a `callback` nothing has looked at.
-    request.state.google_system_parameters_checked = True
+    # Whether `callback` was checked is what :func:`rendered` needs to know, and only this call can
+    # say so: a ROUTER dependency runs once a route has matched, so an unrouted family path reaches
+    # the renderer with a `callback` nothing has looked at.
+    request.state.google_system_parameters_checked = callback
     value = xgafv(request.query_params)
     if value is not None and value not in XGAFV_VALUES:
         raise bad_system_parameter(XGAFV, value)
-    callback = jsonp_callback(request)
-    if callback is not None and not _CALLBACK_NAME.fullmatch(callback):
-        raise bad_jsonp_callback(callback)
+    if not callback:
+        return
+    name = jsonp_callback(request)
+    if name is not None and not _CALLBACK_NAME.fullmatch(name):
+        raise bad_jsonp_callback(name)
 
 
 def has_errors_array(fam: str, value: str | None) -> bool:
@@ -784,12 +843,13 @@ def rendered(
     parameter reaches the success path only (``routers.google._sheets_respond``) and nothing here
     reads it.
 
-    Wrapped only where ``validate_system_parameters`` ran, which is where a route matched. That is a
-    ROUTER dependency, so a family path with NO route -- `/sheets/v4/nope` -- reaches this having
-    been refused nothing, and `callback=a b` there would be answered by calling `a b`. Real answers
-    such a path from its front end as HTML, measured 2026-09-16 with a `callback` and without: 400
-    on Sheets, Docs and Slides, 404 on Drive and Gmail. So JSONP is not its shape there under any
-    name, and the plain body is the nearer of the two answers Backlot can give.
+    Wrapped only where ``validate_system_parameters`` checked `callback`, which is where a route
+    matched and did not exempt it. That is a ROUTER dependency, so a family path with NO route --
+    `/sheets/v4/nope` -- reaches this having been refused nothing, and `callback=a b` there would be
+    answered by calling `a b`. Real answers such a path from its front end as HTML, measured
+    2026-09-16 with a `callback` and without: 400 on Sheets, Docs and Slides, 404 on Drive and
+    Gmail. So JSONP is not its shape there under any name, and the plain body is the nearer of the
+    two answers Backlot can give.
 
     Where the check DID run the name needs no second look, and the body being wrapped may BE its
     refusal -- that is real's own answer, measured the same day: `callback=evil);alert(1);//` on a

@@ -233,7 +233,7 @@ because that is where Google puts them.
 | Endpoint | Notes |
 |---|---|
 | `POST /oauth2/token` | Turns a Google-style client credential into a bearer token the rest of Backlot already understands. Two grants: `refresh_token`, where the refresh token *is* the user's token from `/_meta/users`, and a signed service-account JWT assertion, whose `sub` claim selects the impersonated user under domain-wide delegation. A bare service account with no `sub` resolves to the admin/service identity. Expiry is cosmetic — a re-refresh returns the same token, so a long crawl never breaks |
-| `POST /batch`, `POST /batch/{api}/{version}` | Google's `multipart/mixed` batch envelope: each part is an `application/http` sub-request, answered in order with its `Content-ID` preserved. The outer credential applies to any sub-request that does not carry its own, as real Google does |
+| `POST /batch`, `POST /batch/{api}/{version}` | Google's `multipart/mixed` batch envelope: each part is an `application/http` sub-request, answered in order with its `Content-ID` preserved. The outer credential applies to any sub-request that does not carry its own, as real Google does. As in real's Drive batch, a Drive download (`files.export` with no `alt`, an empty one or `alt=media`, or `files.get` with `alt=media`) is a 302 to the same path under `/download`, which this server does not serve, after `$.xgafv` and after a `Bearer` credential the part carries (a part with none, on it or on the batch, is redirected too), and ahead of `callback` and the typed, lookup, `fields` and `mimeType` refusals; as in real's Sheets batch, a Sheets read is 501 `UNIMPLEMENTED` |
 
 `/batch` is Google-shaped but not Google-scoped — sub-requests are dispatched against the whole
 app, so a batch may target any endpoint this server serves, not only Google Drive's.
@@ -272,12 +272,12 @@ it and an `alt` naming a format other than `json` suppresses the wrap altogether
 matched without regard to case and an empty `alt=` names none, so `alt=JSON`, `alt=Json` and
 `alt=` each ask for the JSON the default serves rather than for a format of their own. An empty
 `callback=` is no callback, and a POST ignores the parameter outright, as real does, since JSONP is
-what a `<script>` element fetches and a `<script>` element issues a GET. A SUCCESS body is wrapped
-and indented on the `/sheets/v4` routes only; the other four families honour `callback` on their
-errors and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides
-APIs on 2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the
-suppression across the four non-Sheets families next, and the escape set and the case-insensitive
-`alt` last.
+what a `<script>` element fetches and a `<script>` element issues a GET. A Drive download inside a
+batch is neither refused nor wrapped (the `/batch` row above). A SUCCESS body is wrapped and
+indented on the `/sheets/v4` routes only; the other four families honour `callback` on their errors
+and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides APIs on
+2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the suppression
+across the four non-Sheets families next, and the escape set and the case-insensitive `alt` last.
 
 **A repeated query parameter is read from the end real reads it from**, which is the first for some
 parameters and the last for others. The first repeat decides `fields`, `q`, `pageSize`, `pageToken`
@@ -308,6 +308,17 @@ export to, the empty `mimeType=` among them, with `The requested conversion is n
 matching the format without regard to case, refuses an absent `mimeType` ahead of looking the file
 up, and serves an export under the `mimeType` exactly as sent, with no `charset`. Measured against
 the live Drive and Sheets APIs on 2026-09-23, and the export's `Content-Type` on 2026-09-30.
+
+**Four Drive flags spelled `true`, in any case, run a check of their own**, where `1`, `t` and `yes`
+parse as true and run none. `includeItemsFromAllDrives` or `includeTeamDriveItems` on `files.list`
+without `supportsAllDrives` or `supportsTeamDrives` spelled the same way is 403
+`supportsTeamDrivesRequired`, between the `orderBy` and `q` refusals. `acknowledgeAbuse` on a
+`files.get` that downloads nothing is 403 `invalidAbuseAcknowledgment`, before the file is looked
+up, and inside a batch only on its one part that is not a download. `useDomainAdminAccess`, since
+every caller here is a Workspace member and none is its domain's administrator, is 404
+`File not found` on `permissions.list` and 403 `noListTeamDrivesAdministratorPrivilege` on
+`drives.list`. Each flag is read from its first repeat. Measured against the live Drive API as such
+a member on 2026-10-06, on its own and in a batch.
 
 **A Sheets read enum is taken by its name in any ASCII case, with `-` for `_`, or by the number the
 name has**, in the query string and in a data-filter body alike, and `DIMENSION_UNSPECIFIED` reads
