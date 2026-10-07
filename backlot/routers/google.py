@@ -2313,7 +2313,11 @@ async def drive_files_permissions(file_id: str, request: Request):
         request, "supportsAllDrives", "supportsTeamDrives", "useDomainAdminAccess", page_size=True
     )["pageSize"]
     _drive_page_size_in_range(sizes, 100)
-    _drive_listing_page_token(request, expired_empty=True)
+    # Empty is 403 pageTokenExpired; a token this route did not issue is 400. Both come before the
+    # file lookup, as they did when the route issued none. Measured 2026-10-05: a pageSize pages a
+    # My Drive file's permissions in the unpaged order, and an absent pageSize returns the whole
+    # list. Folder paging was not measured; the same slice is applied to the grant-derived list.
+    offset = _drive_permissions_page_token(request)
     # No caller here is a domain administrator: 404 for the file, even one the caller owns,
     # measured 2026-10-04 on a consumer account and 2026-10-06 on a Workspace member.
     if _drive_true(request, "useDomainAdminAccess"):
@@ -2327,11 +2331,10 @@ async def drive_files_permissions(file_id: str, request: Request):
         name = _drive_folder_name_by_id(conn, file_id)
         if name is None:
             raise gerr.not_found_file(file_id)
-        return {
-            "kind": "drive#permissionList",
-            "permissions": _drive_permissions(conn, file_id, folder=name),
-        }
-    return {"kind": "drive#permissionList", "permissions": _drive_permissions(conn, row["id"])}
+        permissions = _drive_permissions(conn, file_id, folder=name)
+    else:
+        permissions = _drive_permissions(conn, row["id"])
+    return _drive_permissions_page(permissions, sizes, offset)
 
 
 # --- Google Workspace editors read APIs (Docs / Sheets / Slides) ------------------
@@ -4469,22 +4472,24 @@ def _drive_page_size_in_range(sizes: list[int], top: int) -> None:
 
 def _drive_listing_page_token(request: Request, *, expired_empty: bool = False) -> None:
     """Refuse a `pageToken` sent to a listing that issues no `nextPageToken`, where every token is
-    one it did not issue: `permissions.list`, which serves a file's whole sharing on one page, and
-    `drives.list`, which is empty. Presence is the whole test: `decode_cursor_or_none`, which
-    `files.list` calls, reads `bzow` and that route's own tokens as offsets. Read from the first
-    repeat, after the typed and range refusals and ahead of the `useDomainAdminAccess=true` refusal
-    and `permissions.list`'s file lookup. Measured 2026-10-04 and 2026-10-05, and the empty, `bad`,
-    `bzow`, `BOGUS` and issued-token cells again on 2026-10-07 as a Workspace member::
+    one it did not issue. `drives.list` is empty and still uses this. `permissions.list` pages, so
+    it validates its own tokens in `_drive_permissions_page_token` instead. Presence is the whole
+    test: `decode_cursor_or_none`, which `files.list` calls, reads `bzow` and that route's own
+    tokens as offsets. Read from the first repeat, after the typed and range refusals and ahead of
+    the `useDomainAdminAccess=true` refusal. Measured 2026-10-04 and 2026-10-05, and the empty,
+    `bad`, `bzow`, `BOGUS` and issued-token cells again on 2026-10-07 as a Workspace member::
 
         pageToken                         permissions.list          drives.list
         --------------------------------|-------------------------|-------------------------
         empty                           | 403 `pageTokenExpired`  | the first page
         `bad`, `bzow`, `AAAA`           | 400 `Invalid Value`     | 400 `Invalid Value`
         `BOGUS`, `0`, `a`, a space, a   | 500 `Unknown Error.`    | 400 `Invalid Value`
-        token `files.list` issued       |                         |
+        token `files.list` issued       | 400 `Invalid Value`     | 400 `Invalid Value`
 
     ``expired_empty`` asks for the empty row's 403, which only `permissions.list` answers. The 500
-    is not modelled; those tokens get the 400 here too."""
+    is not modelled; those tokens get the 400 here too. A `files.list` token is one this route did
+    not issue, so `permissions.list` refuses it the same way `files.list` refuses a foreign token.
+    """
     token = gerr.first_repeat(request.query_params, "pageToken")
     if token is None:
         return
@@ -4492,6 +4497,61 @@ def _drive_listing_page_token(request: Request, *, expired_empty: bool = False) 
         raise gerr.page_token_expired()
     if token:
         raise gerr.invalid_value("pageToken")
+
+
+def _drive_permissions_page_token(request: Request) -> int:
+    """The offset a `permissions.list` page token names.
+
+    An absent token is the first page. An empty one is 403 `pageTokenExpired`, and any token this
+    route did not issue — `bad`, `bzow`, or a token `files.list` issued — is 400 `Invalid Value`.
+    Measured 2026-10-05 (empty and the unpaged route) and 2026-10-07 (foreign spellings). The 500
+    real answers for `BOGUS` is not modelled. Read from the first repeat, before the file lookup.
+    """
+    token = gerr.first_repeat(request.query_params, "pageToken")
+    if token is None:
+        return 0
+    if not token:
+        raise gerr.page_token_expired()
+    offset = _decode_permissions_cursor(token)
+    if offset is None:
+        raise gerr.invalid_value("pageToken")
+    return offset
+
+
+def _encode_permissions_cursor(offset: int) -> str:
+    """A page token `files.list` will not accept. That listing's tokens are `o:<offset>`."""
+    return base64.urlsafe_b64encode(f"perm:{offset}".encode()).decode()
+
+
+def _decode_permissions_cursor(token: str) -> int | None:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not raw.startswith("perm:"):
+        return None
+    try:
+        return max(0, int(raw[5:]))
+    except ValueError:
+        return None
+
+
+def _drive_permissions_page(permissions: list[dict], sizes: list[int], offset: int) -> dict:
+    """One page of a permission list.
+
+    An absent `pageSize` returns the whole list, which is what real does for a My Drive file
+    (measured 2026-10-05: two permissions, no `nextPageToken`). A `pageSize` in 1..100 returns that
+    many, in the unpaged order, with a `nextPageToken` only when another page remains. Two or more
+    `pageSize` values are not range-checked; the first in-range value is the page length, and a
+    first value outside 1..100 leaves the list unpaged — the same request already served every
+    permission before this route read `pageSize`.
+    """
+    page_size = sizes[0] if sizes and 1 <= sizes[0] <= 100 else None
+    page = permissions[offset:] if page_size is None else permissions[offset : offset + page_size]
+    body = {"kind": "drive#permissionList", "permissions": page}
+    if page_size is not None and offset + len(page) < len(permissions):
+        body["nextPageToken"] = _encode_permissions_cursor(offset + len(page))
+    return body
 
 
 def _drive_page_size(sizes: list[int]) -> int:

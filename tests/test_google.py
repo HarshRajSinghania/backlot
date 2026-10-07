@@ -1194,7 +1194,7 @@ def test_drive_a_listing_takes_an_int32_page_size_from_1_to_its_top(
     """The rules `_INT32` and `_drive_page_size_in_range` record, on each route, each value alone
     unless the row lists two. `range` is the range refusal naming the value as an int, `int32` the
     proto layer's `TYPE_INT32` one quoting it, and `size` a 200, which on `files.list` lists that
-    many files; `permissions.list` and `drives.list` declare a page size and read none here."""
+    many files. `drives.list` declares a page size and reads none here; `permissions.list` pages, covered by `test_drive_permissions_list_pages`."""
     fill = {"top": top, "above": top + 1}
     named = named.format(**fill)
     url = path.format(doc=_drive_find(client, admin_h, "Brand")["id"])
@@ -1338,6 +1338,7 @@ _TOKEN_EXPIRED = {
             ]
         ],
         (_PERMS, [("pageToken", "")], _TOKEN_EXPIRED),
+        (_PERMS, [("pageToken", "{token}")], _TOKEN_INVALID),
         (_PERMS, [("useDomainAdminAccess", "true"), ("pageToken", "")], _TOKEN_EXPIRED),
         ("/drive/v3/files/nosuchfileid000000/permissions", [("pageToken", "")], _TOKEN_EXPIRED),
         ("/drive/v3/drives", [("pageToken", "{token}")], _TOKEN_INVALID),
@@ -1346,9 +1347,10 @@ _TOKEN_EXPIRED = {
     ],
 )
 def test_drive_a_listing_that_issues_no_page_token_refuses_one(client, admin_h, path, query, error):
-    """The rule `_drive_listing_page_token` records, one request per row. `None` is a token that
-    changes nothing: the answer is the one the request gets without it, a page or the refusal of
-    the value beside it. `{token}` is filled from the first page of `files.list`."""
+    """The rule `_drive_listing_page_token` records for `drives.list`, and the foreign-token rows of
+    `permissions.list`. `None` is a token that changes nothing: the answer is the one the request
+    gets without it, a page or the refusal of the value beside it. `{token}` is filled from the
+    first page of `files.list`, which neither route issued."""
     url = path.format(doc=_drive_find(client, admin_h, "Brand")["id"])
     issued = client.get("/drive/v3/files", headers=admin_h, params={"pageSize": 1}).json()
     query = [(k, v.format(token=issued["nextPageToken"])) for k, v in query]
@@ -1359,6 +1361,35 @@ def test_drive_a_listing_that_issues_no_page_token_refuses_one(client, admin_h, 
     else:
         assert (r.status_code, _gerr(r)) == (error["code"], error)
 
+
+
+def test_drive_permissions_list_pages(client, admin_h):
+    """Measured 2026-10-05: pageSize=1 on a two-permission file returns one and a nextPageToken;
+    that token returns the other and no nextPageToken; pageSize of 2, 3 or 100, and no pageSize,
+    return both with no token. The pages are the unpaged list sliced in order."""
+    doc = client.get("/drive/v3/files", headers=admin_h).json()["files"][0]["id"]
+    url = f"/drive/v3/files/{doc}/permissions"
+    whole = client.get(url, headers=admin_h)
+    assert whole.status_code == 200, whole.text
+    permissions = whole.json()["permissions"]
+    assert len(permissions) >= 2, permissions
+    assert "nextPageToken" not in whole.json()
+    first = client.get(url, headers=admin_h, params={"pageSize": 1})
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["permissions"] == permissions[:1]
+    assert "nextPageToken" in body
+    second = client.get(
+        url, headers=admin_h, params={"pageSize": 1, "pageToken": body["nextPageToken"]}
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["permissions"] == permissions[1:2]
+    assert "nextPageToken" not in second.json()
+    for size in (2, 3, 100):
+        page = client.get(url, headers=admin_h, params={"pageSize": size})
+        assert page.status_code == 200, page.text
+        assert page.json()["permissions"] == permissions[:size]
+        assert "nextPageToken" not in page.json()
 
 @pytest.mark.parametrize(
     "query, code, location",
