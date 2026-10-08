@@ -336,46 +336,38 @@ def test_gmail_threads_list_is_the_mailbox_searched_or_not(client, tokens):
     )
 
 
-def test_gmail_attachment_resolves_under_a_hex_message_id(client, admin_h, ro_conn):
-
-    row = ro_conn.execute(
-        "SELECT * FROM gmail_messages WHERE COALESCE(attachments,'') NOT IN ('', '[]') LIMIT 1"
-    ).fetchone()
-    assert row is not None, "SAMPLE should hold a message with an attachment"
-    hexid = row["id"]
-    m = client.get(
-        f"/gmail/v1/users/me/messages/{hexid}", headers=admin_h, params={"format": "full"}
-    ).json()
-    att = next(p for p in m["payload"]["parts"] if p.get("filename"))
-    r = client.get(
-        f"/gmail/v1/users/me/messages/{hexid}/attachments/{att['body']['attachmentId']}",
-        headers=admin_h,
-    )
-    assert r.status_code == 200 and r.json()["size"] > 0
-
-
 @pytest.mark.parametrize(
-    "msg_key, att_key, expect_status",
-    [
-        ("valid", "valid", 200),
-        ("valid", "bogus", 400),
-        ("valid", "altered", 400),
-        ("missing", "bogus", 400),
-        ("non_hex", "bogus", 400),
-    ],
+    "msg_key",
+    ["owner", "other", "missing", "non_hex"],
+)
+@pytest.mark.parametrize(
+    "att_key, expect_status",
+    [("valid", 200), ("bogus", 400), ("altered", 400)],
 )
 def test_gmail_attachment_errors(client, admin_h, ro_conn, msg_key, att_key, expect_status):
+    """Under each of the four message ids, an attachment id gets the answer it gets under its own
+    message: 200 with its bytes when a message holds it, 400 when none does, as the comment in
+    `gmail_attachment` records."""
     row = ro_conn.execute(
         "SELECT * FROM gmail_messages WHERE COALESCE(attachments,'') NOT IN ('', '[]') LIMIT 1"
     ).fetchone()
     assert row is not None, "SAMPLE should hold a message with an attachment"
     hexid = row["id"]
+    other_row = ro_conn.execute(
+        "SELECT id FROM gmail_messages WHERE id != ? LIMIT 1", (hexid,)
+    ).fetchone()
+    assert other_row is not None, "SAMPLE should hold a second gmail message"
     m = client.get(
         f"/gmail/v1/users/me/messages/{hexid}", headers=admin_h, params={"format": "full"}
     ).json()
     valid_att = next(p for p in m["payload"]["parts"] if p.get("filename"))["body"]["attachmentId"]
 
-    msg_id = hexid if msg_key == "valid" else "0000000000000001" if msg_key == "missing" else "zzz"
+    msg_id = {
+        "owner": hexid,
+        "other": other_row["id"],
+        "missing": "0000000000000001",
+        "non_hex": "zzz",
+    }[msg_key]
     att_id = (
         valid_att
         if att_key == "valid"
@@ -405,6 +397,106 @@ def test_gmail_attachment_errors(client, admin_h, ro_conn, msg_key, att_key, exp
                 "status": "INVALID_ARGUMENT",
             }
         }
+    else:
+        owned = client.get(
+            f"/gmail/v1/users/me/messages/{hexid}/attachments/{valid_att}", headers=admin_h
+        ).json()
+        assert owned["size"] > 0
+        assert r.json() == owned
+
+
+_ATTACHMENT_ACL = [
+    {
+        "source_type": "gmail",
+        "doc_id": "ava-deck",
+        "mailbox": "ava",
+        "title": "Deck",
+        "content": "Deck attached.",
+        "author_email": "ava@acme.com",
+        "readers": ["ava@acme.com"],
+        "created": "2026-02-01T09:00:00Z",
+        "attachments": [{"filename": "deck.pdf", "mime": "application/pdf", "content": "deck"}],
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "ava-memo",
+        "mailbox": "ava",
+        "title": "Memo",
+        "content": "Memo attached.",
+        "author_email": "ava@acme.com",
+        "readers": ["ava@acme.com"],
+        "created": "2026-02-02T09:00:00Z",
+        "attachments": [{"filename": "memo.txt", "mime": "text/plain"}],
+    },
+    {
+        "source_type": "gmail",
+        "doc_id": "mia-note",
+        "mailbox": "mia",
+        "title": "Note",
+        "content": "No attachment.",
+        "author_email": "mia@acme.com",
+        "readers": ["mia@acme.com"],
+        "created": "2026-02-03T09:00:00Z",
+    },
+]
+
+
+@pytest.fixture
+def attachment_acl(tmp_path):
+    """Two of ava's messages with one attachment each, and a message of mia's with none. Yields the
+    client, a header per caller, and each attachment id by the doc it belongs to."""
+    settings = tiny_corpus(tmp_path, _ATTACHMENT_ACL)
+    tokens = yaml.safe_load(settings.tokens_path.read_text())
+    h = {"admin": {"Authorization": f"Bearer {settings.admin_token}"}}
+    for name in ("ava", "mia"):
+        h[name] = {"Authorization": f"Bearer {tok(tokens, f'{name}@acme.com')}"}
+    with client_for(settings, reload=True) as client:
+        att = {}
+        for doc in ("ava-deck", "ava-memo"):
+            m = client.get(
+                f"/gmail/v1/users/me/messages/{served_id('gmail', doc)}", headers=h["admin"]
+            ).json()
+            att[doc] = next(p for p in m["payload"]["parts"] if p.get("filename"))["body"][
+                "attachmentId"
+            ]
+        yield client, h, att
+
+
+@pytest.mark.parametrize("under", ["ava-deck", "ava-memo", "mia-note"])
+@pytest.mark.parametrize("caller", ["admin", "ava", "mia"])
+def test_gmail_attachment_is_found_by_its_id_within_the_acl(
+    attachment_acl, monkeypatch, under, caller
+):
+    """Under each of the three message ids, each of ava's attachment ids lands its own bytes for
+    the admin and ava, and mia, who cannot see ava's messages, gets the 400 an id nothing has gets.
+    The memo states no `content`, so its bytes are the stand-in `_att_content` writes, which names
+    the attachment's id. The scan the comment in `gmail_attachment` describes is skipped only when
+    the path names the message holding the attachment and the caller can see it. It reads ava's two
+    messages for the admin and ava, and none for mia, whose one message holds no attachment."""
+    client, h, att = attachment_acl
+    scanned, scan = [], store.gmail_rows_with_attachments
+
+    def spy(*args, **kwargs):
+        rows = scan(*args, **kwargs)
+        scanned.append({row["id"] for row in rows})
+        return rows
+
+    monkeypatch.setattr(store, "gmail_rows_with_attachments", spy)
+    want = {"ava-deck": b"deck", "ava-memo": f"attachment {att['ava-memo']}".encode()}
+    reads = set() if caller == "mia" else {served_id("gmail", doc) for doc in want}
+    for doc, content in want.items():
+        scanned.clear()
+        r = client.get(
+            f"/gmail/v1/users/me/messages/{served_id('gmail', under)}/attachments/{att[doc]}",
+            headers=h[caller],
+        )
+        if caller == "mia":
+            assert r.status_code == 400, doc
+            assert r.json()["error"]["message"] == "Invalid attachment token", doc
+        else:
+            assert r.status_code == 200, doc
+            assert base64.urlsafe_b64decode(r.json()["data"]) == content, doc
+        assert scanned == ([] if under == doc and caller != "mia" else [reads]), doc
 
 
 @pytest.mark.parametrize(
@@ -1295,6 +1387,71 @@ def test_drive_a_page_token_it_did_not_issue_is_refused(client, admin_h):
     assert token.status_code == 200 and token.json()["files"] != first["files"]
 
 
+_PERMS = "/drive/v3/files/{doc}/permissions"
+_TOKEN_INVALID = {
+    "code": 400,
+    "message": "Invalid Value",
+    "errors": [
+        {
+            "message": "Invalid Value",
+            "domain": "global",
+            "reason": "invalid",
+            "location": "pageToken",
+            "locationType": "parameter",
+        }
+    ],
+}
+_TOKEN_EXPIRED = {
+    "code": 403,
+    "message": "The specified page token has expired, and can no longer be used.",
+    "errors": [
+        {
+            "message": "The specified page token has expired, and can no longer be used.",
+            "domain": "global",
+            "reason": "pageTokenExpired",
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "path, query, error",
+    [
+        *[
+            (path, query, error)
+            for path in (_PERMS, "/drive/v3/drives")
+            for query, error in [
+                ([("pageToken", "bad")], _TOKEN_INVALID),
+                ([("pageToken", "bzow")], _TOKEN_INVALID),
+                ([("useDomainAdminAccess", "true"), ("pageToken", "bad")], _TOKEN_INVALID),
+                ([("pageToken", "bad"), ("useDomainAdminAccess", "true")], _TOKEN_INVALID),
+                ([("pageToken", "bad"), ("pageSize", "0")], None),
+                ([("pageToken", "bad"), ("useDomainAdminAccess", "NOPE")], None),
+            ]
+        ],
+        (_PERMS, [("pageToken", "")], _TOKEN_EXPIRED),
+        (_PERMS, [("useDomainAdminAccess", "true"), ("pageToken", "")], _TOKEN_EXPIRED),
+        ("/drive/v3/files/nosuchfileid000000/permissions", [("pageToken", "")], _TOKEN_EXPIRED),
+        ("/drive/v3/drives", [("pageToken", "{token}")], _TOKEN_INVALID),
+        ("/drive/v3/drives", [("pageToken", "")], None),
+        ("/drive/v3/drives", [("useDomainAdminAccess", "true"), ("pageToken", "")], None),
+    ],
+)
+def test_drive_a_listing_that_issues_no_page_token_refuses_one(client, admin_h, path, query, error):
+    """The rule `_drive_listing_page_token` records, one request per row. `None` is a token that
+    changes nothing: the answer is the one the request gets without it, a page or the refusal of
+    the value beside it. `{token}` is filled from the first page of `files.list`."""
+    url = path.format(doc=_drive_find(client, admin_h, "Brand")["id"])
+    issued = client.get("/drive/v3/files", headers=admin_h, params={"pageSize": 1}).json()
+    query = [(k, v.format(token=issued["nextPageToken"])) for k, v in query]
+    r = client.get(url, headers=admin_h, params=query)
+    if error is None:
+        without = [(k, v) for k, v in query if k != "pageToken"]
+        assert r.content == client.get(url, headers=admin_h, params=without).content
+    else:
+        assert (r.status_code, _gerr(r)) == (error["code"], error)
+
+
 @pytest.mark.parametrize(
     "query, code, location",
     [
@@ -1313,11 +1470,57 @@ def test_drive_a_page_token_it_did_not_issue_is_refused(client, admin_h):
         ([("orderBy", "name,name"), ("q", "nosuchfield = 1")], 403, "orderBy"),
         ([("pageToken", "BOGUS"), ("orderBy", "name,name")], 403, "orderBy"),
         ([("fields", "bogus"), ("orderBy", "name,name")], 403, "orderBy"),
+        ([("orderBy", "name,starred"), ("pageSize", "0")], 400, "page_size"),
+        ([("orderBy", "name,starred"), ("q", "nosuchfield = 1")], 400, "q"),
+        ([("orderBy", "name,starred"), ("pageToken", "BOGUS")], 400, "pageToken"),
+        ([("fields", "bogus"), ("orderBy", "name,starred")], 500, None),
+        ([("fields", ""), ("orderBy", "name,starred")], 500, None),
+        ([("q", "name = 'no such file'"), ("orderBy", "name,starred")], 500, None),
+        (
+            [("q", "fullText contains 'the'"), ("orderBy", "name"), ("pageSize", "0")],
+            400,
+            "page_size",
+        ),
+        (
+            [("q", "fullText contains 'the'"), ("orderBy", "name"), ("pageSize", "NOPE")],
+            400,
+            None,
+        ),
+        ([("q", "fullText contains 'the'"), ("orderBy", "bogus")], 400, "orderBy"),
+        ([("q", "fullText contains 'the' and nosuchfield = 1"), ("orderBy", "name")], 400, "q"),
+        (
+            [("q", "fullText contains 'the' and nosuchfield = 1"), ("orderBy", "viewedByMeTime")],
+            400,
+            "q",
+        ),
+        (
+            [("q", "fullText contains 'the'"), ("orderBy", "name"), ("pageToken", "BOGUS")],
+            403,
+            "orderBy",
+        ),
+        (
+            [("pageToken", "BOGUS"), ("q", "fullText contains 'the'"), ("orderBy", "name")],
+            403,
+            "orderBy",
+        ),
+        (
+            [("q", "fullText contains 'the'"), ("orderBy", "name"), ("fields", "bogus")],
+            403,
+            "orderBy",
+        ),
+        (
+            [("fields", "bogus"), ("q", "fullText contains 'the'"), ("orderBy", "name")],
+            403,
+            "orderBy",
+        ),
+        ([("q", "fullText contains 'the'"), ("orderBy", "name"), ("fields", "")], 403, "orderBy"),
+        ([("fields", ""), ("q", "fullText contains 'the'"), ("orderBy", "name")], 403, "orderBy"),
     ],
 )
 def test_drive_files_list_refuses_in_reals_order(client, admin_h, query, code, location):
-    """Two bad values at once, each pair in the order `drive_files_list`'s comment records. A
-    `pageSize` the proto layer cannot read has no `location`."""
+    """Two values at once, refused in the order `drive_files_list`'s comment records, where a `q`
+    with a `fullText` term and an `orderBy` count as one, the 403. A `pageSize` the proto layer
+    cannot read has no `location`."""
     e = _gerr(client.get("/drive/v3/files", headers=admin_h, params=query))
     assert e["code"] == code
     assert e["errors"][0].get("location") == location
@@ -1453,6 +1656,8 @@ _DRIVE_CHECK_ROWS = [
     ("/drive/v3/files", "includeItemsFromAllDrives=true&pageSize=0", "admin", _RANGE),
     ("/drive/v3/files", "includeItemsFromAllDrives=true&orderBy=bogus", "admin", (400, "invalid", "orderBy", None)),
     ("/drive/v3/files", "includeItemsFromAllDrives=true&orderBy=name,name", "admin", (403, "orderByContainsDuplicateSortKeys", "orderBy", None)),
+    ("/drive/v3/files", "includeItemsFromAllDrives=true&orderBy=name,starred", "admin", _SHARED_DRIVES),
+    ("/drive/v3/files", "q=fullText%20contains%20%27zzqqxx%27&orderBy=viewedByMeTime&includeItemsFromAllDrives=true", "admin", _SHARED_DRIVES),
     ("/drive/v3/files", "includeItemsFromAllDrives=true&q=bad", "admin", _SHARED_DRIVES),
     ("/drive/v3/files", "includeItemsFromAllDrives=true&pageToken=bad", "admin", _SHARED_DRIVES),
     ("/drive/v3/files", "includeItemsFromAllDrives=true&fields=bad", "admin", _SHARED_DRIVES),
@@ -1528,6 +1733,7 @@ def test_drive_answers_each_check_with_reals_status_and_reason(
         ("/drive/v3/files/{id}", "acknowledgeAbuse=NOPE", None, None),
         ("/drive/v3/files/{id}/permissions", "supportsAllDrives=NOPE", None, None),
         ("/drive/v3/files/{id}/permissions", "pageSize=0", None, None),
+        ("/drive/v3/files/{id}/permissions", "pageToken=bad", None, None),
         ("/sheets/v4/spreadsheets/{id}/values/Sheet1!A1", "majorDimension=NOPE", None, None),
         ("/sheets/v4/spreadsheets/{id}/values:batchGet", "valueRenderOption=NOPE", None, None),
         ("/sheets/v4/spreadsheets/{id}", "includeGridData=NOPE", None, None),
@@ -2324,6 +2530,8 @@ REPEATED = [
     ("GET", _FILES, {}, "pageSize", "1", "3", "first", _ids),
     ("GET", _FILES, {"pageSize": "1"}, "pageToken", "{token}", "BOGUS", "first", _ids),
     ("GET", _FILES, {"pageSize": "1"}, "pageToken", "", "{token}", "first", _ids),
+    ("GET", _FILES + "/{sid}/permissions", {}, "pageToken", "", "bad", "first", _keys),
+    ("GET", "/drive/v3/drives", {}, "pageToken", "", "bad", "first", _keys),
     ("GET", _FILES, {"pageSize": "3"}, "orderBy", "name", "name desc", "first", _names),
     ("GET", _FILES, {"pageSize": "3"}, "orderBy", "name", "bogus", "first", _names),
     (
@@ -2380,12 +2588,23 @@ def test_every_google_get_refuses_a_callback_it_cannot_call_and_no_post_reads_on
 
     `callback` is NOT declared router-wide beside `$.xgafv` — Sheets is the only family whose
     SUCCESS is wrapped, and `qp` declares only what Backlot honours — so this is the whole of what
-    the document says about it."""
+    the document says about it.
+
+    A byte-stream read is not JSONP and is pinned by the tests beside
+    `test_a_callback_on_a_download_is_real_503_to_the_byte` instead, because the answer an
+    uncallable name gets there is not this 400 but real's 503 `Backend Error` (measured 2026-10-04
+    and 2026-10-07) -- which is what the anonymous case here asserts before the path leaves the
+    sweep."""
     spec = client.get("/openapi.json").json()
     families = ("/drive/v3", "/gmail/v1", "/docs/v1", "/sheets/v4", "/slides/v1")
     gets, posts, wrong = 0, 0, []
     for path, item in spec["paths"].items():
         if not path.startswith(families):
+            continue
+        if path.endswith("/export"):
+            anonymous = client.get(f"{path}?callback=a%20b")
+            assert anonymous.status_code == 503, path
+            assert "Backend Error" in anonymous.text, path
             continue
         for method, op in item.items():
             if method not in ("get", "post", "put", "patch", "delete"):
@@ -2714,6 +2933,197 @@ def test_drive_export_and_media_stay_non_json(client, admin_h):
     assert med.status_code == 200 and "application/json" not in med.headers["content-type"]
 
 
+# Real's 503 body for a download carrying a `callback`, to the byte: measured 2026-10-07 over the
+# thirteen request shapes that reach one, the `errors[]` entry is written INLINE and the body ends
+# with the closing brace and no trailing newline -- which is not the shape `respond`, the serializer
+# every other Google body goes through, writes for that envelope.
+DOWNLOAD_503_BODY = (
+    "{\n"
+    '  "error": {\n'
+    '    "code": 503,\n'
+    '    "message": "Backend Error",\n'
+    '    "errors": [{\n'
+    '      "message": "Backend Error",\n'
+    '      "domain": "global",\n'
+    '      "reason": "backendError"\n'
+    "    }]\n"
+    "  }\n"
+    "}"
+)
+DOWNLOAD_503_TYPE = "text/javascript; charset=UTF-8"
+MISSING_API_KEY = "The request is missing a valid API key."
+
+
+def _download_requests(client, admin_h):
+    """The two byte-stream reads of the bundled corpus, and the metadata read of the same PDF."""
+    pdf = _drive_find(client, admin_h, "Whitepaper")["id"]
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    return {
+        "media": (f"/drive/v3/files/{pdf}", {"alt": "media"}),
+        "export": (f"/drive/v3/files/{doc}/export", {"mimeType": "text/plain"}),
+        "metadata": (f"/drive/v3/files/{pdf}", {}),
+        "doc": doc,
+    }
+
+
+def test_a_download_names_the_missing_api_key_where_the_metadata_read_does_not(client, admin_h):
+    """Measured 2026-10-04 on `files.export` and 2026-10-05 on `files.get?alt=media`: a byte-stream
+    read with no credential answers real's missing-API-key sentence with `reason: forbidden` and no
+    `status`, where the metadata read of the same file answers the unregistered caller."""
+    requests = _download_requests(client, admin_h)
+    for kind in ("media", "export"):
+        url, params = requests[kind]
+        refusal = client.get(url, params=params)
+        assert refusal.status_code == 403, url
+        error = refusal.json()["error"]
+        assert error["message"] == MISSING_API_KEY, url
+        assert error["errors"][0]["reason"] == "forbidden", url
+        assert "status" not in error, url
+    metadata_url, metadata_params = requests["metadata"]
+    metadata = client.get(metadata_url, params=metadata_params)
+    assert metadata.json()["error"]["status"] == "PERMISSION_DENIED"
+
+
+def test_a_download_answers_its_parameters_before_a_missing_credential(client, admin_h):
+    """Measured 2026-10-07: without a credential a download answers an absent `mimeType` and a
+    mistyped `supportsAllDrives` with their 400, where the metadata read of the same file answers
+    the unregistered caller first. Together with the `callback` 503 ahead of them and the missing
+    API key after, that is the whole measured order a byte-stream read answers in. Beside a callable
+    `callback` each of the two is the download's 503 instead, credential or not."""
+    pdf = _drive_find(client, admin_h, "Whitepaper")["id"]
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    bad_param = (f"/drive/v3/files/{pdf}", {"alt": "media", "supportsAllDrives": "NOPE"})
+    no_mime = (f"/drive/v3/files/{doc}/export", {})
+    for url, params in (bad_param, no_mime):
+        anonymous = client.get(url, params=params)
+        assert anonymous.status_code == 400, (url, anonymous.text)
+        assert client.get(url, params=params, headers=admin_h).status_code == 400, url
+        assert client.get(url, params={**params, "callback": "cb"}).status_code == 503, url
+    assert "TYPE_BOOL" in client.get(bad_param[0], params=bad_param[1]).text
+    assert "mimeType" in client.get(no_mime[0], params=no_mime[1]).text
+    metadata = client.get(f"/drive/v3/files/{pdf}", params={"supportsAllDrives": "NOPE"})
+    assert metadata.status_code == 403
+    assert metadata.json()["error"]["status"] == "PERMISSION_DENIED"
+
+
+def test_a_callback_on_a_download_is_real_503_to_the_byte(client, admin_h):
+    """Measured 2026-10-07: a `callback` that cannot be called on a byte-stream read is 503
+    `Backend Error` under the script's type, unwrapped, and the body is one fixed string -- the
+    `errors[]` entry inline and no trailing newline, where the serializer every other Google body
+    goes through writes the array expanded and ends with one.
+
+    The same request with no credential answers it too: the callback is refused ahead of the
+    missing-API-key 403, which is the order real answers them in."""
+    requests = _download_requests(client, admin_h)
+    for kind in ("media", "export"):
+        url, params = requests[kind]
+        for headers in (admin_h, {}):
+            refusal = client.get(url, params={**params, "callback": "a b"}, headers=headers)
+            assert refusal.status_code == 503, (kind, headers)
+            assert refusal.headers["content-type"] == DOWNLOAD_503_TYPE, kind
+            assert refusal.text == DOWNLOAD_503_BODY, kind
+    # the exception the route raises still describes that body, so the signal and the literal
+    # cannot drift apart
+    assert json.loads(DOWNLOAD_503_BODY) == gerr.http_body(
+        "/drive/v3/files/x", gerr.backend_error()
+    )
+
+
+def test_a_callback_on_a_download_turns_every_later_error_into_the_same_503(client, admin_h):
+    """Measured 2026-10-07: on a byte-stream read carrying a name a script can call, EVERY error is
+    the same 503 `Backend Error` -- a missing id, a Docs file read with `alt=media`, a mistyped
+    `supportsAllDrives`, an absent `mimeType` and no credential alike -- where each of those without
+    the callback keeps its own status. Only a success lets the name through."""
+    pdf = _drive_find(client, admin_h, "Whitepaper")["id"]
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    for url, params, headers in (
+        (f"/drive/v3/files/{pdf}", {"alt": "media", "supportsAllDrives": "NOPE"}, admin_h),
+        ("/drive/v3/files/nosuch", {"alt": "media"}, admin_h),
+        (f"/drive/v3/files/{doc}", {"alt": "media"}, admin_h),
+        (f"/drive/v3/files/{doc}/export", {}, admin_h),
+        (f"/drive/v3/files/{pdf}", {"alt": "media"}, {}),
+    ):
+        plain = client.get(url, params=params, headers=headers)
+        assert plain.status_code != 503, (url, plain.text)
+        refusal = client.get(url, params={**params, "callback": "cb"}, headers=headers)
+        assert refusal.status_code == 503, (url, refusal.text)
+        assert refusal.text == DOWNLOAD_503_BODY, (url, refusal.text)
+
+
+def test_the_refusal_order_on_a_download_is_system_bearer_then_callback(client, admin_h):
+    """On both downloads, `$.xgafv` 400 first, then a `Bearer` token that does not resolve 401, then
+    the callback's 503 -- the order `gerr.missing_api_key` records. Only the header
+    `_sends_a_bearer_token` accepts is a credential at that layer (`_require_download_bearer`):
+    every other value below reaches the callback's 503 beside `callback=a b`, and each of them is
+    a 401 without one."""
+    requests = _download_requests(client, admin_h)
+    for kind in ("media", "export"):
+        url, params = requests[kind]
+        bad = {**params, "callback": "a b"}
+        xgafv = client.get(url, params={**bad, "$.xgafv": "9"}, headers=BAD_TOKEN)
+        assert xgafv.status_code == 400 and XGAFV_REFUSAL.format("9") in xgafv.text, kind
+        for value, beside_callback in (
+            ("Bearer not-a-real-token", 401),
+            ("bearer not-a-real-token", 503),
+            ("BEARER not-a-real-token", 503),
+            ("token not-a-real-token", 503),
+            ("Bearer", 503),
+            ("bearer", 503),
+            ("nope", 503),
+            ("Basic YWJjOmRlZg==", 503),
+        ):
+            headers = {"Authorization": value}
+            answer = client.get(url, params=bad, headers=headers)
+            assert answer.status_code == beside_callback, (kind, value)
+            if beside_callback == 503:
+                assert answer.text == DOWNLOAD_503_BODY, (kind, value)
+            else:
+                assert answer.json()["error"]["status"] == "UNAUTHENTICATED", (kind, value)
+            assert client.get(url, params=params, headers=headers).status_code == 401, (kind, value)
+
+
+def test_a_download_is_the_route_not_the_path_shape(client, admin_h):
+    """Measured 2026-10-07: an export asking for `alt=json` is not a download but an ordinary read
+    -- the unregistered-caller 403 without a credential, the wrapped `callback` 400 with one -- and
+    a file whose id is literally `export` is a `files.get`, answering the metadata read."""
+    doc = _drive_find(client, admin_h, "Brand")["id"]
+    anonymous = client.get(f"/drive/v3/files/{doc}/export", params={"mimeType": "x", "alt": "json"})
+    assert anonymous.status_code == 403
+    assert anonymous.json()["error"]["status"] == "PERMISSION_DENIED"
+    wrapped = client.get(
+        f"/drive/v3/files/{doc}/export",
+        params={"mimeType": "x", "alt": "json", "callback": "a b"},
+        headers=admin_h,
+    )
+    assert wrapped.status_code == 200 and "Invalid JSONP callback name" in wrapped.text
+    literal = client.get("/drive/v3/files/export")
+    assert literal.status_code == 403
+    assert literal.json()["error"]["status"] == "PERMISSION_DENIED"
+    cb = client.get("/drive/v3/files/export", params={"callback": "a b"}, headers=admin_h)
+    assert cb.status_code == 200 and "Invalid JSONP callback name" in cb.text
+
+
+def test_a_download_reads_the_first_callback_repeat_and_an_empty_one_is_none(client, admin_h):
+    """Measured 2026-10-07: `cb&a b` on a download answers the bytes where `a b&cb` answers the 503,
+    so the first repeat decides as it does for every other `callback`. An empty `callback=` is no
+    callback at all: the download answers the plain 403."""
+    pdf = _drive_find(client, admin_h, "Whitepaper")["id"]
+    url = f"/drive/v3/files/{pdf}"
+    raw = client.get(url, params={"alt": "media"}, headers=admin_h)
+    first = client.get(f"{url}?alt=media&callback=cb&callback=a%20b", headers=admin_h)
+    assert first.status_code == 200 and first.content == raw.content
+    second = client.get(f"{url}?alt=media&callback=a%20b&callback=cb", headers=admin_h)
+    assert second.status_code == 503 and second.text == DOWNLOAD_503_BODY
+    assert client.get(f"{url}?alt=media&callback=", headers=admin_h).content == raw.content
+    anonymous = client.get(f"{url}?alt=media&callback=")
+    assert anonymous.status_code == 403
+    assert anonymous.json()["error"]["message"] == MISSING_API_KEY
+    # ...and the case of `alt` does not decide either: `alt=MEDIA` is the same download, and the
+    # same callback 503, as `alt=media` (measured 2026-09-17 and 2026-10-07)
+    upper = client.get(f"{url}?alt=MEDIA&callback=a%20b", headers=admin_h)
+    assert upper.status_code == 503 and upper.text == DOWNLOAD_503_BODY
+
+
 def test_the_alt_that_downloads_is_read_the_way_every_other_alt_is(client, admin_h, tokens):
     """Case does not decide a download and neither does the last repeat.
 
@@ -2949,32 +3359,89 @@ def test_drive_order_by_rejects_keys_it_cannot_honor(client, admin_h):
     assert ok.status_code == 200
 
 
+_DUPLICATE_403 = (
+    "orderByContainsDuplicateSortKeys",
+    "The orderBy parameter cannot contain duplicate sort keys.",
+)
+_FULLTEXT_403 = (
+    "forbidden",
+    "Sorting is not supported for queries with fullText terms. Results are always in descending relevance order.",
+)
+
+
 @pytest.mark.parametrize(
-    "order_by, status",
+    "q, order_by, status, error",
     [
-        ("name", 200),
-        ("name,modifiedTime", 200),
-        ("name desc,modifiedTime", 200),
-        ("recency,modifiedTime", 200),
-        ("name,name", 403),
-        ("name desc,name", 403),
-        ("name,name desc", 403),
-        ("name desc,name desc", 403),
-        ("modifiedTime,name,modifiedTime", 403),
-        ("name_natural,name", 403),
-        ("name,name_natural", 403),
-        ("name,name,bogus", 403),
-        ("name,bogus,name", 400),
-        ("name,name sideways", 400),
+        (None, "name", 200, None),
+        (None, "name,modifiedTime", 200, None),
+        (None, "name desc,modifiedTime", 200, None),
+        (None, "recency,modifiedTime", 200, None),
+        (None, "name,name", 403, _DUPLICATE_403),
+        (None, "name desc,name", 403, _DUPLICATE_403),
+        (None, "name,name desc", 403, _DUPLICATE_403),
+        (None, "name desc,name desc", 403, _DUPLICATE_403),
+        (None, "modifiedTime,name,modifiedTime", 403, _DUPLICATE_403),
+        (None, "name_natural,name", 403, _DUPLICATE_403),
+        (None, "name,name_natural", 403, _DUPLICATE_403),
+        (None, "name,name,bogus", 403, _DUPLICATE_403),
+        (None, "name,bogus,name", 400, None),
+        (None, "name,name sideways", 400, None),
+        (None, "starred", 200, None),
+        (None, "starred desc", 200, None),
+        (None, "starred,name", 200, None),
+        (None, "starred desc,name", 200, None),
+        (None, "starred,name,folder", 200, None),
+        (None, ",starred", 200, None),
+        (None, "name,starred", 500, None),
+        (None, "name, starred", 500, None),
+        (None, "name desc,starred desc", 500, None),
+        (None, "folder,starred,name", 500, None),
+        (None, "name,folder,starred", 500, None),
+        (None, "createdTime,starred", 500, None),
+        (None, "quotaBytesUsed,starred", 500, None),
+        (None, "name,,starred", 500, None),
+        (None, "name,starred,name", 403, _DUPLICATE_403),
+        (None, "starred,starred", 403, _DUPLICATE_403),
+        (None, "name,starred,bogus", 400, None),
+        ("fullText contains 'the'", "name", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "name desc", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "name,modifiedTime", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "name,starred", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "name,viewedByMeTime", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "viewedByMeTime", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "viewedByMeTime desc", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "modifiedByMeTime", 403, _FULLTEXT_403),
+        ("fullText contains 'the'", "name,name", 403, _DUPLICATE_403),
+        ("fullText contains 'the'", "viewedByMeTime,viewedByMeTime", 403, _DUPLICATE_403),
+        ("fullText contains 'zzqqxx'", "name", 403, _FULLTEXT_403),
+        ("fullText contains 'zzqqxx'", None, 200, None),
+        ("fullText contains 'zzqqxx'", "", 200, None),
+        ("fullText contains 'zzqqxx' and trashed = false", "name", 403, _FULLTEXT_403),
+        ("fullText contains 'zzqqxx' or name contains 'zzqqxx'", "name", 403, _FULLTEXT_403),
+        ("not fullText contains 'the'", "name", 403, _FULLTEXT_403),
+        ("(fullText contains 'the')", "name", 403, _FULLTEXT_403),
+        ("name contains 'the'", "name", 200, None),
+        ("name contains 'fullText'", "name", 200, None),
     ],
 )
-def test_drive_order_by_refuses_a_repeated_sort_key(client, admin_h, order_by, status):
-    """A key named twice is the 403 `_drive_order_specs` describes, and its `error` object is the
-    one real sends; an unusable token at or before the repeat is the 400."""
-    r = client.get("/drive/v3/files", headers=admin_h, params={"pageSize": 1, "orderBy": order_by})
+def test_drive_order_by_is_refused_where_real_refuses_it(
+    client, admin_h, q, order_by, status, error
+):
+    """`orderBy` on its own and beside a `q`, answered with the 403s `_drive_order_specs` and
+    `gerr.sorting_not_supported_fulltext` describe and the 500 `gerr.drive_internal_error`
+    describes, each `error` object the one real sends. An unusable token at or before a repeat is
+    the 400, the parse is refused ahead of the 500 wherever `starred` sits and the repeat ahead of
+    the `fullText` 403, and an absent or empty `orderBy`, or a `q` with no `fullText` term, is
+    served."""
+    params = {"pageSize": 1, "q": q, "orderBy": order_by}
+    r = client.get(
+        "/drive/v3/files",
+        headers=admin_h,
+        params={k: v for k, v in params.items() if v is not None},
+    )
     assert r.status_code == status, r.text
-    if status == 403:
-        message = "The orderBy parameter cannot contain duplicate sort keys."
+    if error is not None:
+        reason, message = error
         assert _gerr(r) == {
             "code": 403,
             "message": message,
@@ -2982,10 +3449,18 @@ def test_drive_order_by_refuses_a_repeated_sort_key(client, admin_h, order_by, s
                 {
                     "message": message,
                     "domain": "global",
-                    "reason": "orderByContainsDuplicateSortKeys",
+                    "reason": reason,
                     "location": "orderBy",
                     "locationType": "parameter",
                 }
+            ],
+        }
+    if status == 500:
+        assert _gerr(r) == {
+            "code": 500,
+            "message": "Internal Error",
+            "errors": [
+                {"message": "Internal Error", "domain": "global", "reason": "internalError"}
             ],
         }
 

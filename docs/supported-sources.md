@@ -265,31 +265,42 @@ paragraph separators, and the format characters as Unicode 4.0 drew that categor
 emoji, NBSP, `&` and `'` stay as they are. `callback` turns one into JSONP: HTTP **200** with
 `text/javascript; charset=UTF-8` and the body inside `// API callback\ncb({…}\n);`, which is what
 lets a page loading the answer through a `<script>` element reach its error branch rather than
-`onerror`. A name that cannot be a JavaScript one is refused with real's own sentence — `only
-alphabet, number, '_', '$', '.', '[' and ']' are allowed` — ahead of a bad token, a missing
-credential, an unparseable range and a mistyped `fields` mask, though `$.xgafv` is refused ahead of
-it and an `alt` naming a format other than `json` suppresses the wrap altogether — the format is
-matched without regard to case and an empty `alt=` names none, so `alt=JSON`, `alt=Json` and
-`alt=` each ask for the JSON the default serves rather than for a format of their own. An empty
+`onerror`. On an ordinary read, a name that cannot be a JavaScript one is refused with real's own
+sentence — `only alphabet, number, '_', '$', '.', '[' and ']' are allowed` — ahead of a bad token, a
+missing credential, an unparseable range and a mistyped `fields` mask, though `$.xgafv` is refused
+ahead of it and an `alt` naming a format other than `json` suppresses the wrap altogether — the
+format is matched without regard to case and an empty `alt=` names none, so `alt=JSON`, `alt=Json`
+and `alt=` each ask for the JSON the default serves rather than for a format of their own. An empty
 `callback=` is no callback, and a POST ignores the parameter outright, as real does, since JSONP is
-what a `<script>` element fetches and a `<script>` element issues a GET. A Drive download inside a
-batch is neither refused nor wrapped (the `/batch` row above). A SUCCESS body is wrapped and
-indented on the `/sheets/v4` routes only; the other four families honour `callback` on their errors
-and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides APIs on
-2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the suppression
-across the four non-Sheets families next, and the escape set and the case-insensitive `alt` last.
+what a `<script>` element fetches and a `<script>` element issues a GET. A Drive download — an
+export with no `alt` or with `alt=media`, or a `files.get` with `alt=media` — is not JSONP at all: a
+`callback` there is never wrapped, is ignored when the download succeeds, and turns every other
+answer into 503 `Backend Error` under `text/javascript; charset=UTF-8` with a body of real's own
+(the `errors[]` entry inline and no trailing newline), while a name that cannot be called is that
+503 even where the download would have succeeded. A missing credential on one names the missing API
+key rather than the unregistered caller, and only after the download's `mimeType` and
+typed-parameter checks, so the order a byte-stream read answers in is `$.xgafv`, a `Bearer` token
+that does not resolve (that scheme, spelt exactly so), the `callback`, the parameters, then that
+403. Inside a batch a download is a 302 instead (the `/batch` row above). A SUCCESS body is wrapped
+and indented on the `/sheets/v4` routes only; the other four families honour `callback` on their
+errors and not yet on their 200s. Measured against the live Sheets, Docs, Drive, Gmail and Slides
+APIs on 2026-09-15, 2026-09-16 and 2026-09-17: the wrap, the indent and the charset first, the
+suppression across the four non-Sheets families next, and the escape set and the case-insensitive
+`alt` last; the download refusals on 2026-10-04, 2026-10-05, 2026-10-07 and 2026-10-08.
 
 **A repeated query parameter is read from the end real reads it from**, which is the first for some
 parameters and the last for others. The first repeat decides `fields`, `q`, `pageSize`, `pageToken`
-and `orderBy` on Drive's `files.list`, `fields` on `files.get` and `about`, and `mimeType` on
-`files.export`, and on Sheets `fields` and `prettyPrint`, as it decides `callback` and `alt`; the
-last decides `$.xgafv`, `majorDimension`, `valueRenderOption` and `includeGridData`. An empty first
-repeat is read as the empty value, not skipped. Gmail's `q`, `pageToken` and `maxResults` are read
-here from the last, and which end real reads is unmeasured. On a Sheets success, `prettyPrint` is
-compact at `false` and `0` and at none of the eighteen other spellings measured, `FALSE`, `no` and
-`f` among them. Measured against the live Drive, Sheets and Gmail APIs, each pair sent both ways
-round: `callback`, `alt` and the Sheets `$.xgafv` between 2026-09-15 and 2026-09-17,
-`includeGridData` and the Gmail `$.xgafv` on 2026-09-22, and the rest on 2026-09-23.
+and `orderBy` on Drive's `files.list`, `pageToken` on `permissions.list` and `drives.list`, `fields`
+on `files.get` and `about`, and `mimeType` on `files.export`, and on Sheets `fields` and
+`prettyPrint`, as it decides `callback` and `alt`; the last decides `$.xgafv`, `majorDimension`,
+`valueRenderOption` and `includeGridData`. An empty first repeat is read as the empty value, not
+skipped. Gmail's `q`, `pageToken` and `maxResults` are read here from the last, and which end real
+reads is unmeasured. On a Sheets success, `prettyPrint` is compact at `false` and `0` and at none of
+the eighteen other spellings measured, `FALSE`, `no` and `f` among them. Measured against the live
+Drive, Sheets and Gmail APIs, each pair sent both ways round: `callback`, `alt` and the Sheets
+`$.xgafv` between 2026-09-15 and 2026-09-17, `includeGridData` and the Gmail `$.xgafv` on
+2026-09-22, `pageToken` on the other two Drive listings on 2026-10-05 and 2026-10-07, and the rest
+on 2026-09-23.
 
 **A typed query parameter is parsed in every repeat, and every value it cannot read is refused in
 one 400**: the message joins theirs with newlines and `details` carries a `google.rpc.BadRequest`
@@ -298,16 +309,23 @@ field violation for each, a parameter's repeats together and in query order, on 
 `excludeTablesInBandedRanges`, Drive's `pageSize` and the booleans each served Drive method declares
 (`supportsAllDrives`, `includeItemsFromAllDrives`, `acknowledgeAbuse`, `useDomainAdminAccess` and
 the two deprecated team-drive ones) alike, and a Sheets data-filter body's values carry the same
-`details`. A typed refusal comes after the credential check and before the file or spreadsheet
-is looked up. On Drive's `files.list`, one `pageSize` outside 1-1000 is refused with the range
-sentence (1-100 on `permissions.list` and `drives.list`), while a repeated one is read from the
-first and never range-checked; a `pageToken` it did not issue is 400 `Invalid Value`; and the
-refusals come in the order `pageSize`, `orderBy`, `q`, `pageToken`, `fields`. A blank `fields` on
+`details`. A typed refusal comes after the credential check and before the file or spreadsheet is
+looked up. On Drive's `files.list`, one `pageSize` outside 1-1000 is refused with the range sentence
+(1-100 on `permissions.list` and `drives.list`), while a repeated one is read from the first and
+never range-checked; a `pageToken` it did not issue is 400 `Invalid Value`; and the refusals come in
+the order `pageSize`, `orderBy`, `q`, an `orderBy` beside a `fullText` term in `q` (403
+`forbidden`), `pageToken`, `fields`, an `orderBy` naming `starred` after another key being real's
+500 `Internal Error` between `pageToken` and `fields`. `permissions.list` and `drives.list` issue no
+`nextPageToken` and refuse every non-empty `pageToken` with that 400, and `permissions.list` an
+empty one with 403 `pageTokenExpired`, after the typed and range refusals and ahead of the
+`useDomainAdminAccess=true` refusal and `permissions.list`'s file lookup. A blank `fields` on
 `files.list` or `files.get` answers `{}`. `files.export` refuses a format the file's type does not
 export to, the empty `mimeType=` among them, with `The requested conversion is not supported.`,
 matching the format without regard to case, refuses an absent `mimeType` ahead of looking the file
 up, and serves an export under the `mimeType` exactly as sent, with no `charset`. Measured against
-the live Drive and Sheets APIs on 2026-09-23, and the export's `Content-Type` on 2026-09-30.
+the live Drive and Sheets APIs on 2026-09-23, the `fullText` 403 on 2026-10-05 and 2026-10-07, the
+`starred` 500 on 2026-10-04 and 2026-10-07, the `pageToken` of `permissions.list` and `drives.list`
+on 2026-10-04, 2026-10-05 and 2026-10-07, and the export's `Content-Type` on 2026-09-30.
 
 **Four Drive flags spelled `true`, in any case, run a check of their own**, where `1`, `t` and `yes`
 parse as true and run none. `includeItemsFromAllDrives` or `includeTeamDriveItems` on `files.list`
