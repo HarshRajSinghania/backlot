@@ -29,34 +29,6 @@ def test_admin_hubspot_crawls_all(client, admin_h, ro_conn):
     assert all(r["archived"] is True for r in archived)
 
 
-def test_hubspot_repeated_archived_uses_the_first_value(client, admin_h):
-    """A repeated `archived` on an object listing is the view the first value names.
-
-    Measured against api.hubapi.com on 2026-10-07: `archived=true&archived=false` lists the
-    archived view, and `archived=false&archived=true` lists the active view. An empty value is
-    not an archived spelling, so `archived=&archived=true` stays on the active view.
-    """
-    active = client.get("/hubspot/crm/v3/objects/companies", headers=admin_h).json()["results"]
-    archived = client.get(
-        "/hubspot/crm/v3/objects/companies?archived=true", headers=admin_h
-    ).json()["results"]
-    assert active and archived
-    assert {r["id"] for r in active}.isdisjoint({r["id"] for r in archived})
-
-    def ids(query: str) -> list[str]:
-        return [
-            r["id"]
-            for r in client.get(
-                f"/hubspot/crm/v3/objects/companies?{query}", headers=admin_h
-            ).json()["results"]
-        ]
-
-    assert ids("archived=true&archived=false") == [r["id"] for r in archived]
-    assert ids("archived=false&archived=true") == [r["id"] for r in active]
-    assert ids("archived=true&archived=") == [r["id"] for r in archived]
-    assert ids("archived=&archived=true") == [r["id"] for r in active]
-
-
 def test_hubspot_list_cursor_pages_without_overlap(client, admin_h):
     """The cursor path itself: pages of two over the three non-archived companies, no repeats, no
     gaps, and the walk ends by `paging.next` disappearing rather than by a page coming back empty."""
@@ -970,3 +942,31 @@ def test_hubspot_page_omits_paging_next_on_last_page(tmp_path):
     rows = store.list_hubspot_objects(conn, "companies", limit=3)  # 1 non-archived company
     assert "paging" not in _page(rows, 10, None)
     assert _page(rows, 1, None)["results"]  # a full page still yields rows
+
+
+def test_hubspot_repeated_archived_uses_the_first_value(client, admin_h):
+    """A repeated `archived` on an object listing is the view the first value names.
+
+    Measured against api.hubapi.com on 2026-10-07: `archived=true&archived=false` lists the
+    archived view, and `archived=false&archived=true` lists the active view. An empty value is
+    not an archived spelling, so `archived=&archived=true` stays on the active view.
+    """
+    active = client.get("/hubspot/crm/v3/objects/companies", headers=admin_h).json()["results"]
+    archived = client.get(
+        "/hubspot/crm/v3/objects/companies?archived=true", headers=admin_h
+    ).json()["results"]
+    assert active and archived
+    assert {r["id"] for r in active}.isdisjoint({r["id"] for r in archived})
+
+    def ids(query: str) -> list[str]:
+        return [
+            r["id"]
+            for r in client.get(
+                f"/hubspot/crm/v3/objects/companies?{query}", headers=admin_h
+            ).json()["results"]
+        ]
+
+    assert ids("archived=true&archived=false") == [r["id"] for r in archived]
+    assert ids("archived=false&archived=true") == [r["id"] for r in active]
+    assert ids("archived=true&archived=") == [r["id"] for r in archived]
+    assert ids("archived=&archived=true") == [r["id"] for r in active]
