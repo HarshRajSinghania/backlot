@@ -49,11 +49,28 @@ def test_admin_hubspot_crawls_all(client, admin_h, ro_conn):
         ("true\r", False),
         ("\u00a0true", False),
         ("true\u00a0", False),
+        (["true", "false"], True),
+        (["true", ""], True),
+        (["true", "abc"], True),
+        (["TRUE", "false"], True),
+        (["True", "false"], True),
+        (["true", "false", "false"], True),
+        (["false", "true"], False),
+        (["", "true"], False),
+        (["yes", "true"], False),
+        (["1", "true"], False),
+        (["abc", "true"], False),
+        ([" true", "true"], False),
+        (["false", "TRUE"], False),
+        (["false", "false", "true"], False),
     ],
 )
-def test_hubspot_archived_parameter_reads_only_true_as_true(client, admin_h, value, archived):
-    """`_flag`'s rule over companies: the one archived company when `_flag` reads the value as true,
-    and otherwise the same page as a request without `archived`."""
+def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
+    client, admin_h, value, archived
+):
+    """`_flag`'s rule over companies, on the first value when `archived` repeats (a list row is
+    sent as the key repeated in list order): the one archived company when `_flag` reads that value
+    as true, and otherwise the same page as a request without `archived`."""
     url = "/hubspot/crm/v3/objects/companies"
     r = client.get(url, headers=admin_h, params={"archived": value})
     assert r.status_code == 200
@@ -976,31 +993,3 @@ def test_hubspot_page_omits_paging_next_on_last_page(tmp_path):
     rows = store.list_hubspot_objects(conn, "companies", limit=3)  # 1 non-archived company
     assert "paging" not in _page(rows, 10, None)
     assert _page(rows, 1, None)["results"]  # a full page still yields rows
-
-
-def test_hubspot_repeated_archived_uses_the_first_value(client, admin_h):
-    """A repeated `archived` on an object listing is the view the first value names.
-
-    Measured against api.hubapi.com on 2026-10-07: `archived=true&archived=false` lists the
-    archived view, and `archived=false&archived=true` lists the active view. An empty value is
-    not an archived spelling, so `archived=&archived=true` stays on the active view.
-    """
-    active = client.get("/hubspot/crm/v3/objects/companies", headers=admin_h).json()["results"]
-    archived = client.get(
-        "/hubspot/crm/v3/objects/companies?archived=true", headers=admin_h
-    ).json()["results"]
-    assert active and archived
-    assert {r["id"] for r in active}.isdisjoint({r["id"] for r in archived})
-
-    def ids(query: str) -> list[str]:
-        return [
-            r["id"]
-            for r in client.get(
-                f"/hubspot/crm/v3/objects/companies?{query}", headers=admin_h
-            ).json()["results"]
-        ]
-
-    assert ids("archived=true&archived=false") == [r["id"] for r in archived]
-    assert ids("archived=false&archived=true") == [r["id"] for r in active]
-    assert ids("archived=true&archived=") == [r["id"] for r in archived]
-    assert ids("archived=&archived=true") == [r["id"] for r in active]

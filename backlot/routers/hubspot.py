@@ -166,12 +166,11 @@ def _flag(raw) -> bool:
 
 
 def _first_query(qp, name: str):
-    """The first value of a repeated query key.
-
-    Measured against api.hubapi.com on 2026-10-07: a listing that sends `archived` more than once
-    is the view the first value names. Starlette's `QueryParams.get` returns the last, so the
-    listing must read `getlist` and take the first element (an absent key is still un-archived).
-    """
+    """The first value the query carries for ``name``, or ``None`` when it carries none.
+    Real reads a repeated `archived` on an object listing from its first value, measured against
+    api.hubapi.com (2026-10-07, 2026-10-08): `archived=true&archived=false` serves the archived
+    view, and `archived=false&archived=true`, `archived=&archived=true` and
+    `archived=yes&archived=true` the active one. Starlette's `QueryParams.get` returns the last."""
     values = qp.getlist(name)
     return values[0] if values else None
 
