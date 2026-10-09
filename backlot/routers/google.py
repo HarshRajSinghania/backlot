@@ -46,18 +46,20 @@ from backlot.pagination import decode_cursor, decode_cursor_or_none, next_page_t
 
 
 def _system_parameters(request: Request) -> None:
-    """`gerr.validate_system_parameters`, with `callback` left alone on a Drive download inside a
-    batch, which real redirects whatever `callback` holds -- see `_drive_batch_redirect`."""
-    gerr.validate_system_parameters(request, callback=not _drive_batch_download(request))
+    """`gerr.validate_system_parameters`, with `callback` left alone on a Drive download: real
+    answers an uncallable name there with its own 503, and a batch part with a 302, rather than
+    refusing the name (see `gerr.refuse_download` and `_drive_batch_redirect`)."""
+    gerr.validate_system_parameters(request, callback=not _drive_download_request(request))
 
 
 router = APIRouter(tags=["google"], dependencies=[Depends(_system_parameters)])
 
 
 # --- OpenAPI enrichment --------------------------------------------------
-# Query params are read query-only (via _int/request.query_params); documenting them with
-# openapi_extra keeps the handler bodies untouched and merges cleanly with the auto-generated
-# path params. Response models use extra="allow" so builders' full field set passes through.
+# Query params are read query-only (via request.query_params, a typed one through _typed_query).
+# Documenting them with openapi_extra keeps the handler bodies untouched and merges cleanly with
+# the auto-generated path params. Response models use extra="allow" so builders' full field set
+# passes through.
 
 
 class _GLoose(BaseModel):
@@ -254,18 +256,49 @@ async def batch(request: Request, api: str = "", version: str = "") -> Response:
     return Response(content=body, media_type=f'multipart/mixed; boundary="{_BATCH_BOUNDARY}"')
 
 
-def _require(request: Request) -> Caller:
+def _require(request: Request, *, download: bool = False) -> Caller:
     """The caller, or the error real Google gives — NOT the shared ``auth.require_bearer``, because
     Google's answer is not one status. Measured: a present-but-invalid bearer is 401 UNAUTHENTICATED
     everywhere, while NO Authorization header at all is 403 PERMISSION_DENIED on a Drive or Sheets
     GET (they accept API keys, so an anonymous GET is a caller with no established identity) and
-    401 on the OAuth-only Gmail/Docs/Slides and on a POST to any family."""
+    401 on the OAuth-only Gmail/Docs/Slides and on a POST to any family.
+
+    ``download`` asks for a byte-stream read's answer instead: measured 2026-10-04 on
+    `files.export` and 2026-10-05 on `files.get?alt=media`, a missing credential there names the
+    missing API key (:func:`gerr.missing_api_key`) instead of the anonymous GET's unregistered
+    caller, and real puts it AFTER the download's own parameters — which is why the handlers
+    resolve a download late."""
     caller = auth.resolve_bearer(request)
     if caller is None:
         if not request.headers.get("authorization"):
+            if download:
+                raise gerr.missing_api_key()
             raise gerr.no_credentials(request.url.path, request.method)
         raise gerr.bad_token()
     return caller
+
+
+def _sends_a_bearer_token(request: Request) -> bool:
+    """Whether ``Authorization`` is `Bearer`, spelt exactly so, and a token: the one header a Drive
+    download treats as a credential ahead of its own refusals, on its own
+    (`_require_download_bearer`) and as a batch part (`_drive_batch_redirect`). Narrower than
+    ``auth.bearer_token``, which `_require` reads a credential with and which also takes `bearer`,
+    `BEARER` and `token`."""
+    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
+    return scheme == "Bearer" and bool(token.strip())
+
+
+def _require_download_bearer(request: Request) -> None:
+    """The 401 a Drive download answers ahead of its own refusals, for a `Bearer` token
+    (`_sends_a_bearer_token`) that does not resolve.
+
+    Measured 2026-10-07 and 2026-10-08 on `files.get?alt=media` and `files.export` beside
+    `callback=a b`: `Bearer nope` answers the 401, where `bearer nope`, `BEARER nope`,
+    `token nope`, a bare `Bearer`, `bearer`, `nope` and `Basic YWJjOmRlZg==` each answer the
+    callback's 503. Every other value is left to :func:`gerr.refuse_download`, and without a
+    `callback` is `_require`'s to answer."""
+    if _sends_a_bearer_token(request) and auth.resolve_bearer(request) is None:
+        raise gerr.bad_token()
 
 
 def _b64url(text: str) -> str:
@@ -609,11 +642,42 @@ def _by_thread(rows) -> list:
 
 
 def _gmail_max_results(request: Request) -> int:
-    """The page size `messages.list` and `threads.list` serve. A `maxResults` above 500 is capped
-    at 500, not refused: measured on 2026-10-03, `501` and `1000` each answered 500 messages with a
+    """The page size `messages.list` and `threads.list` serve.
+
+    Measured on gmail.googleapis.com on 2026-10-07 with a Workspace user's `gmail.readonly` token,
+    one request per row; `threads.list` answered every row with the same status and error, on
+    2026-10-07 or 2026-10-08. The proto layer parses every repeat as a uint32 and names every repeat
+    it cannot read in one 400, as `Invalid value at 'max_results' (TYPE_UINT32), "<value>"`, the
+    value quoted as sent. `+2` and `02` are numbers. A leading `-` is refused even on `-0`, and so
+    are an empty value, `1.5`, the Arabic-Indic digit `٣` and a value past 2**32 - 1 (`4294967296`).
+    The method reads the last repeat (the pair is in `gerr.first_repeat`'s table): `0` (`+0`, `00`)
+    and anything from 2**31 up (`2147483648`, `+2147483648`, `4294967295`) are `Invalid maxResults`,
+    while `2147483647` is served; `0&3` is 3 and `3&0` is refused. Below 2**31 a value is capped at
+    500, not refused: on 2026-10-03, `501` and `1000` each answered 500 messages with a
     `nextPageToken`, and the reference gives both methods "The maximum allowed value for this field
-    is 500"."""
-    return min(_int(request.query_params.get("maxResults"), get_settings().default_page_size), 500)
+    is 500". With no `maxResults`, the page is the default size capped at 500. A sent value is also
+    capped at the deployment's `max_page_size`.
+    """
+    sizes = _typed_query(request, {"maxResults": _gmail_uint32})["maxResults"]
+    if not sizes:
+        return min(get_settings().default_page_size, 500)
+    size = sizes[-1]
+    if size == 0 or size >= 2**31:
+        raise gerr.invalid_max_results()
+    return min(size, 500, get_settings().max_page_size)
+
+
+# `maxResults` as Gmail's proto layer reads it: a uint32, where Drive's `pageSize` is an int32
+# (`_INT32`). The spellings and the bound are `_gmail_max_results`'s.
+_UINT32 = re.compile(r"\+?[0-9]+")
+
+
+def _gmail_uint32(raw: str) -> int:
+    if _UINT32.fullmatch(raw) and int(raw) < 2**32:
+        return int(raw)
+    raise gerr.invalid_field_value(
+        "max_results", f"Invalid value at 'max_results' (TYPE_UINT32), \"{raw}\""
+    )
 
 
 def _gmail_ids(row) -> tuple[str, str]:
@@ -698,25 +762,35 @@ async def gmail_attachment(user_id: str, msg_id: str, att_id: str, request: Requ
     conn = auth.conn(request)
     caller = _require(request)
     ids = auth.visible_ids(request, caller)
-    # No shape check on the message id: real Gmail's answer here does not depend on it (see
-    # `gerr.invalid_attachment_token`), so a non-hex one is not "Invalid id value" on this route.
-    row = store.gmail_by_id(conn, msg_id, visible_ids=ids)
-    if row is None:
+    # The path's message id plays no part in the answer, in real Gmail or here: an attachment id
+    # is served under the message it belongs to, under another message's id, under a well-formed
+    # id no message has and under a non-hex id alike, with the same bytes, measured against
+    # gmail.googleapis.com on 2026-10-01 and again on 2026-10-07. The message the path names is
+    # one point lookup, so it is tried first; only an attachment id it does not hold pays for
+    # scanning every attachment-bearing message the caller can see.
+    named = store.gmail_by_id(conn, msg_id, visible_ids=ids)
+    found = _attachment([] if named is None else [named], att_id) or _attachment(
+        store.gmail_rows_with_attachments(conn, visible_ids=ids), att_id
+    )
+    if found is None:
         raise gerr.invalid_attachment_token()
-    message_id = row["id"]
-    found = next(
+    message_id, i, att = found
+    body = _att_content(message_id, i, att)
+    # `{size, data}` alone: real names no `attachmentId` here, measured on 2026-09-30
+    return {"size": _byte_len(body), "data": _b64url(body)}
+
+
+def _attachment(rows, att_id: str) -> tuple[str, int, dict] | None:
+    """The message id, index and attachment among ``rows`` whose ``_att_id`` is ``att_id``."""
+    return next(
         (
-            (i, a)
+            (row["id"], i, a)
+            for row in rows
             for i, a in enumerate(store.jcol(row, "attachments"))
-            if _att_id(message_id, i) == att_id
+            if _att_id(row["id"], i) == att_id
         ),
         None,
     )
-    if not found:
-        raise gerr.invalid_attachment_token()
-    body = _att_content(message_id, found[0], found[1])
-    # `{size, data}` alone: real names no `attachmentId` here, measured on 2026-09-30
-    return {"size": _byte_len(body), "data": _b64url(body)}
 
 
 @router.get(
@@ -1753,9 +1827,9 @@ _DRIVE_ORDER_UNMODELLED = ("viewedByMeTime", "modifiedByMeTime")
 
 def _drive_order_specs(order_by: str | None) -> list[tuple]:
     """Parse ``orderBy`` — comma-separated keys, each optionally suffixed ``desc`` — into
-    ``(key function, reverse)`` pairs. An unusable key is a 400, as on the real API — accepting one
-    and not applying it would let a client relying on server-side ordering pass here and misbehave
-    against the real thing. A key named twice is a 403."""
+    ``(key, reverse)`` pairs. An unusable key is a 400, as on the real API — accepting one and not
+    applying it would let a client relying on server-side ordering pass here and misbehave against
+    the real thing. A key named twice is a 403."""
     specs = []
     seen: set[str] = set()
     for tok in (order_by or "").split(","):
@@ -1765,13 +1839,7 @@ def _drive_order_specs(order_by: str | None) -> list[tuple]:
         key = parts[0]
         if len(parts) > 2 or (len(parts) == 2 and parts[1] != "desc"):
             raise gerr.invalid_value("orderBy", f"Invalid sort key: {tok.strip()}")
-        if key in _DRIVE_ORDER_UNMODELLED:
-            raise gerr.invalid_value(
-                "orderBy",
-                f"Sorting by '{key}' is not supported by Backlot (it models no per-caller "
-                f"view/share timestamps). Supported: {', '.join(sorted(_DRIVE_ORDER_KEYS))}.",
-            )
-        if key not in _DRIVE_ORDER_KEYS:
+        if key not in _DRIVE_ORDER_KEYS and key not in _DRIVE_ORDER_UNMODELLED:
             raise gerr.invalid_value("orderBy", f"Invalid sort key: {tok.strip()}")
         # Real Drive (measured 2026-10-04) 403s a key named twice whatever either direction is, and
         # reads `name_natural` as `name` but `recency` and `modifiedTime` as two keys — so this
@@ -1781,8 +1849,21 @@ def _drive_order_specs(order_by: str | None) -> list[tuple]:
         if name in seen:
             raise gerr.duplicate_sort_keys()
         seen.add(name)
-        specs.append((_DRIVE_ORDER_KEYS[key], len(parts) == 2))
+        specs.append((key, len(parts) == 2))
     return specs
+
+
+def _drive_order_keyfns(specs: list[tuple]) -> list[tuple]:
+    """``(key function, reverse)`` pairs for the keys ``_drive_order_specs`` passed. A key Backlot
+    cannot sort by is refused here, after the 403 a `fullText` term gets."""
+    for key, _ in specs:
+        if key in _DRIVE_ORDER_UNMODELLED:
+            raise gerr.invalid_value(
+                "orderBy",
+                f"Sorting by '{key}' is not supported by Backlot (it models no per-caller "
+                f"view/share timestamps). Supported: {', '.join(sorted(_DRIVE_ORDER_KEYS))}.",
+            )
+    return [(_DRIVE_ORDER_KEYS[key], reverse) for key, reverse in specs]
 
 
 def _drive_sort(files: list[dict], specs: list[tuple]) -> list[dict]:
@@ -1793,6 +1874,14 @@ def _drive_sort(files: list[dict], specs: list[tuple]) -> list[dict]:
     for keyfn, reverse in reversed(specs):
         files.sort(key=keyfn, reverse=reverse)
     return files
+
+
+def _drive_starred_after_another_key(order_by: str | None) -> bool:
+    """Whether ``starred`` follows another key in an ``orderBy`` that ``_drive_order_specs`` passed,
+    the case `gerr.drive_internal_error` answers. An empty token is no key: `,starred` is served and
+    `name,,starred` is the 500."""
+    keys = [parts[0] for tok in (order_by or "").split(",") if (parts := tok.split())]
+    return "starred" in keys[1:]
 
 
 def _drive_q_plain_folder(query) -> bool:
@@ -2100,8 +2189,11 @@ async def drive_files_list(request: Request):
     # Each read off the first repeat, as real reads them -- see `gerr.first_repeat`. Refused in
     # real's order, measured 2026-09-23 by sending two bad values at once: `pageSize` first, then
     # `orderBy`, `q`, `pageToken` and `fields`, whichever order the query names them in. The 403 for
-    # an `orderBy` naming a key twice comes at the same point, measured 2026-10-05, and the
-    # shared-drive 403 between `orderBy` and `q`, measured 2026-10-04.
+    # an `orderBy` naming a key twice comes at the same point, measured 2026-10-05, the shared-drive
+    # 403 between `orderBy` and `q`, measured 2026-10-04, the 403 for an `orderBy` on a `q` with a
+    # `fullText` term between `q` and `pageToken`, measured 2026-10-05 and 2026-10-07, and the 500
+    # for `starred` after another key between `pageToken` and `fields`, measured 2026-10-04 and
+    # 2026-10-07.
     params = request.query_params
     typed = _drive_typed(
         request,
@@ -2123,11 +2215,16 @@ async def drive_files_list(request: Request):
         raise gerr.supports_all_drives_required()
     q = gerr.first_repeat(params, "q") or ""
     query = _drive_q_parse(q)  # 400 on a clause Backlot cannot evaluate; None when there is no q
+    if order and query is not None and any(t.field == "fullText" for t in _drive_q_terms(query)):
+        raise gerr.sorting_not_supported_fulltext()
+    order = _drive_order_keyfns(order)
     # Measured 2026-09-23: a token the API did not issue is 400 `Invalid Value`, where an empty one
     # is the first page.
     offset = decode_cursor_or_none(gerr.first_repeat(params, "pageToken"))
     if offset is None:
         raise gerr.invalid_value("pageToken")
+    if _drive_starred_after_another_key(gerr.first_repeat(params, "orderBy")):
+        raise gerr.drive_internal_error()
     mask = gerr.first_repeat(params, "fields")
     if mask is not None and not mask.strip():
         # The blank mask `_drive_get_field_keys` describes; on a listing it drops `kind` and
@@ -2220,10 +2317,22 @@ async def drive_files_list(request: Request):
 async def drive_files_get(file_id: str, request: Request):
     if _drive_batch_download(request):
         _drive_batch_redirect(request)
+    # A byte-stream read answers in real's measured order: a `Bearer` that does not resolve is its
+    # 401 (2026-10-07), a `callback` is the 503 an uncallable name answers whatever the download
+    # would have done (2026-10-04, 2026-10-05), and the absent credential is named afterwards, once
+    # `_drive_typed` has had its say (2026-10-07) -- `gerr.refuse_download` and the late `_require`.
+    # The metadata read below keeps its own order: its credential first, then the typed parameters.
+    # Inside a batch the redirect above answers first, whatever the part carries.
+    download = _drive_download_request(request)
     conn = auth.conn(request)
-    caller = _require(request)
-    download = gerr.alt_format(request.query_params) == "media"
+    if download:
+        _require_download_bearer(request)
+        gerr.refuse_download(request)
+    else:
+        caller = _require(request)
     _drive_typed(request, "acknowledgeAbuse", "supportsAllDrives", "supportsTeamDrives")
+    if download:
+        caller = _require(request, download=True)
     # Measured 2026-10-04: before the lookup, so a file that does not exist is refused alike, and
     # before `fields`. Inside a batch real checks a part's own flag only when the part is the
     # batch's one part that is not a download, measured 2026-10-05 beside downloads, other reads and
@@ -2264,6 +2373,12 @@ async def drive_files_export(file_id: str, request: Request):
     last one is matched without regard to case -- `TEXT/CSV` exports -- and an empty `mimeType=`
     is one of them rather than an absent parameter.
 
+    A byte-stream read layers real's three download refusals before those, measured 2026-10-04,
+    2026-10-05 and 2026-10-07: a `Bearer` that does not resolve is its 401, a `callback` is the 503
+    an uncallable name answers and the shape every later error takes, and a missing credential is
+    named only after `mimeType` (`gerr.missing_api_key`). An export asking for `alt=json` is none of
+    that -- it is an ordinary read, which `_drive_download` decides.
+
     The export's `Content-Type` is the `mimeType` as sent and nothing more, measured 2026-09-30 on
     eleven formats of a spreadsheet and a document under five `Accept` values each (none, `*/*`,
     `application/json`, `text/html`, `application/xml`): `text/csv`, `TEXT/CSV`, `Text/Csv`,
@@ -2272,11 +2387,18 @@ async def drive_files_export(file_id: str, request: Request):
     lower-case `text/` type."""
     if _drive_batch_download(request):
         _drive_batch_redirect(request)
+    download = _drive_download_request(request)
     conn = auth.conn(request)
-    caller = _require(request)
+    if download:
+        _require_download_bearer(request)
+        gerr.refuse_download(request)
+    else:
+        caller = _require(request)
     requested = gerr.first_repeat(request.query_params, "mimeType")
     if requested is None:
         raise gerr.required("mimeType")
+    if download:
+        caller = _require(request, download=True)
     ids = auth.visible_ids(request, caller)
     row = store.gdrive_by_id(conn, file_id, visible_ids=ids)
     if row is None:
@@ -4369,12 +4491,20 @@ def _drive_download(endpoint, query) -> bool:
     )
 
 
+def _drive_download_request(request: Request) -> bool:
+    """Whether this request is a Drive download (`_drive_download`), read off the route it matched.
+
+    The one question ``_system_parameters`` and the two ``files.get``/``files.export`` handlers ask,
+    so a download sent on its own and one sent as a batch part are answered alike, and so a request
+    that merely LOOKS like one is not: measured 2026-10-07, an export asking for `alt=json` and a
+    file whose id is literally `export` are ordinary reads to real."""
+    return _drive_download(request.scope.get("endpoint"), request.query_params)
+
+
 def _drive_batch_download(request: Request) -> bool:
     """Whether this request is a Drive download sent as a part of a batch. Read off the route the
     request matched, so the router's dependency can ask before the route runs."""
-    return _BATCH_OUTER.get() is not None and _drive_download(
-        request.scope.get("endpoint"), request.query_params
-    )
+    return _BATCH_OUTER.get() is not None and _drive_download_request(request)
 
 
 _URL_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
@@ -4428,8 +4558,7 @@ def _drive_batch_redirect(request: Request) -> None:
     `Foo` does not, and a name the batch repeats is carried every time. The path and the query are
     read from the request's raw bytes, not its decoded URL, in which `%23` would start a
     fragment."""
-    scheme, _, token = (request.headers.get("authorization") or "").partition(" ")
-    if scheme == "Bearer" and token.strip():
+    if _sends_a_bearer_token(request):
         _require(request)
     outer = _BATCH_OUTER.get()
     path = _batch_escapes(request.scope["raw_path"].decode("latin-1"), "-._~")
@@ -4535,10 +4664,3 @@ def _drive_page_size(sizes: list[int]) -> int:
     first = sizes[0]
     size = 1000 if first > 1000 else 500 if first < 1 else first
     return min(size, get_settings().max_page_size)
-
-
-def _int(v: str | None, default: int) -> int:
-    try:
-        return min(int(v), get_settings().max_page_size) if v else default
-    except ValueError:
-        return default
