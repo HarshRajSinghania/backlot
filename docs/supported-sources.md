@@ -292,18 +292,18 @@ suppression across the four non-Sheets families next, and the escape set and the
 
 **A repeated query parameter is read from the end real reads it from**, which is the first for some
 parameters and the last for others. The first repeat decides `fields`, `q`, `pageSize`, `pageToken`
-and `orderBy` on Drive's `files.list`, `pageToken` on `permissions.list` and `drives.list`, `fields`
-on `files.get` and `about`, and `mimeType` on `files.export`, and on Sheets `fields` and
-`prettyPrint`, as it decides `callback` and `alt`; the last decides `$.xgafv`, `majorDimension`,
-`valueRenderOption` and `includeGridData`. An empty first repeat is read as the empty value, not
-skipped. Gmail's `q` and `pageToken` are read here from the last, and which end real reads is
-unmeasured; `maxResults` is parsed in every repeat and read from the last
+and `orderBy` on Drive's `files.list`, `pageSize` and `pageToken` on `permissions.list`, `pageToken`
+on `drives.list`, `fields` on `files.get` and `about`, and `mimeType` on `files.export`, and on
+Sheets `fields` and `prettyPrint`, as it decides `callback` and `alt`; the last decides `$.xgafv`,
+`majorDimension`, `valueRenderOption` and `includeGridData`. An empty first repeat is read as the
+empty value, not skipped. Gmail's `q` and `pageToken` are read here from the last, and which end
+real reads is unmeasured; `maxResults` is parsed in every repeat and read from the last
 (`backlot.routers.google._gmail_max_results`). On a Sheets success, `prettyPrint` is compact at
 `false` and `0` and at none of the eighteen other spellings measured, `FALSE`, `no` and `f` among
 them. Measured against the live Drive, Sheets and Gmail APIs, each pair sent both ways round:
 `callback`, `alt` and the Sheets `$.xgafv` between 2026-09-15 and 2026-09-17, `includeGridData` and
 the Gmail `$.xgafv` on 2026-09-22, `pageToken` on the other two Drive listings on 2026-10-05 and
-2026-10-07, and the rest on 2026-09-23.
+2026-10-07, `pageSize` on `permissions.list` on 2026-10-08, and the rest on 2026-09-23.
 
 **A typed query parameter is parsed in every repeat, and every value it cannot read is refused in
 one 400**: the message joins theirs with newlines and `details` carries a `google.rpc.BadRequest`
@@ -318,18 +318,22 @@ with the range sentence (1-100 on `permissions.list` and `drives.list`), while a
 read from the first and never range-checked; a `pageToken` it did not issue is 400 `Invalid Value`;
 and the refusals come in the order `pageSize`, `orderBy`, `q`, an `orderBy` beside a `fullText` term
 in `q` (403 `forbidden`), `pageToken`, `fields`, an `orderBy` naming `starred` after another key
-being real's 500 `Internal Error` between `pageToken` and `fields`. `permissions.list` and
-`drives.list` issue no `nextPageToken` and refuse every non-empty `pageToken` with that 400, and
-`permissions.list` an empty one with 403 `pageTokenExpired`, after the typed and range refusals and
-ahead of the `useDomainAdminAccess=true` refusal and `permissions.list`'s file lookup. A blank
-`fields` on `files.list` or `files.get` answers `{}`. `files.export` refuses a format the file's
-type does not export to, the empty `mimeType=` among them, with
-`The requested conversion is not supported.`, matching the format without regard to case, refuses an
-absent `mimeType` ahead of looking the file up, and serves an export under the `mimeType` exactly as
-sent, with no `charset`. Measured against the live Drive and Sheets APIs on 2026-09-23, the
-`fullText` 403 on 2026-10-05 and 2026-10-07, the `starred` 500 on 2026-10-04 and 2026-10-07, the
-`pageToken` of `permissions.list` and `drives.list` on 2026-10-04, 2026-10-05 and 2026-10-07, and
-the export's `Content-Type` on 2026-09-30.
+being real's 500 `Internal Error` between `pageToken` and `fields`. `drives.list` issues no
+`nextPageToken` and refuses every non-empty `pageToken` with that 400, after the typed and range
+refusals and ahead of the `useDomainAdminAccess=true` refusal. `permissions.list` pages in the order
+of its unpaged list and issues a `nextPageToken` that only the file it pages takes back. After its
+typed and range refusals, it refuses in the order an empty `pageToken` (403 `pageTokenExpired`) or
+one it did not issue (that 400), two or more `pageSize` values whose first is outside 1-100 (500
+`Unknown Error.`), `useDomainAdminAccess=true`, a file it cannot find, and a token issued for
+another file (403 `pageTokenExpired`). A blank `fields` on `files.list` or `files.get` answers `{}`.
+`files.export` refuses a format the file's type does not export to, the empty `mimeType=` among
+them, with `The requested conversion is not supported.`, matching the format without regard to case,
+refuses an absent `mimeType` ahead of looking the file up, and serves an export under the `mimeType`
+exactly as sent, with no `charset`. Measured against the live Drive and Sheets APIs on 2026-09-23,
+the `fullText` 403 on 2026-10-05 and 2026-10-07, the `starred` 500 on 2026-10-04 and 2026-10-07, the
+`pageToken` of `permissions.list` and `drives.list` on 2026-10-04, 2026-10-05 and 2026-10-07, the
+paging of `permissions.list` on 2026-10-05 and 2026-10-08, and the export's `Content-Type` on
+2026-09-30.
 
 **Four Drive flags spelled `true`, in any case, run a check of their own**, where `1`, `t` and `yes`
 parse as true and run none. `includeItemsFromAllDrives` or `includeTeamDriveItems` on `files.list`
