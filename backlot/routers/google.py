@@ -639,7 +639,7 @@ async def gmail_label_get(user_id: str, label_id: str, request: Request):
 # The lookbehinds cover the address operators and the ones measured to read across whitespace
 # (subject:, label:, in:, after:, newer:). has:, newer_than: and older_than: do not.
 _GMAIL_OP = re.compile(
-    r'(\w+):(?:(?:(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:))\s*)?("[^"]*"|\S*)', re.IGNORECASE
+    r'(\w+):(?:(?:(?<=\bfrom:)|(?<=\bto:)|(?<=\bcc:)|(?<=\bbcc:)|(?<=\bsubject:)|(?<=\blabel:)|(?<=\bin:)|(?<=\bafter:)|(?<=\bnewer:))\s*)?("[^"]*"|\S*)', re.IGNORECASE
 )
 # operators we honor; anything else stays as free text
 _GMAIL_KEYS = {
